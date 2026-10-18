@@ -324,7 +324,8 @@ sam build && sam deploy                                   # us-east-1 (primary) 
 sam build --config-env dr && sam deploy --config-env dr   # us-west-2 (secondary)
 ```
 
-First-time setup of the second region, in order (each step depends on the previous one):
+To create everything from nothing, use `scripts/rebuild.sh` (see [Teardown and rebuild](#teardown-and-rebuild)).
+What it does, in order (each step depends on the previous one):
 1. Deploy the primary stack — it creates the global tables (with the us-west-2 replicas), the user
    pool, its multi-Region KMS key and the user pool replica.
 2. `python scripts/activate_user_pool_replica.py ACTIVE` (the replica is created `INACTIVE`).
@@ -427,39 +428,39 @@ The event-driven core (EventBridge, SQS, SNS and both Lambdas) costs under $2 pe
 orders, including cross-region replication. Identity DR (Cognito multi-Region replication) and
 per-method API metrics dominate.
 
-## Teardown
+## Teardown and rebuild
 
-Delete in this order — each step depends on the previous one:
+Both are scripted, because the multi-region pieces depend on each other and must be created and
+deleted in a fixed order:
 
 ```bash
-export AWS_PROFILE=default
-# 1. Global endpoint first: its managed replication rules sit on both buses, and a bus with
-#    rules can't be deleted
-aws cloudformation delete-stack --region us-east-1 --stack-name orders-event-driven-app-global-endpoint
-aws cloudformation wait stack-delete-complete --region us-east-1 --stack-name orders-event-driven-app-global-endpoint
-
-# 2. Cognito replica must be INACTIVE before it can be deleted
-python scripts/activate_user_pool_replica.py INACTIVE
-
-# 3. Secondary region (it only references the replicas; deletes its KMS replica key - 7-day wait)
-sam delete --config-env dr --no-prompts
-
-# 4. Primary region: global tables and their replicas, user pool + replica, KMS key
-#    (scheduled for deletion after 7 days, once its replica is gone)
-sam delete --no-prompts
-
-# 5. CI/CD bootstrap roles
-aws cloudformation delete-stack --region us-east-1 --stack-name aws-event-driven-application-github-oidc
+SAM="/c/Program Files/Amazon/AWSSAMCLI/bin/sam.cmd"   # or just sam if it's on PATH
+SAM="$SAM" bash scripts/teardown.sh --yes   # ~15 min - deletes all order data in both regions
+SAM="$SAM" bash scripts/rebuild.sh          # ~25-30 min - recreates everything from the templates
 ```
 
-Then check:
-- `aws kms list-keys` / the KMS console: both keys show `PendingDeletion` (or
-  `PendingReplicaDeletion`) — they stop billing once deleted.
-- DynamoDB in both regions: no `orders-event-driven-app-*` tables.
-- The SAM artifact buckets `aws-sam-cli-managed-default-*` in both regions are shared with other
-  projects (us-east-1 with Project 3) — empty the `orders-event-driven-app/` prefix only.
-- GitHub: remove the repository secrets `AWS_DEPLOY_ROLE_ARN` / `AWS_CFN_EXECUTION_ROLE_ARN`.
-- Billing → Bills the next day: no remaining `us-west-2` / Route 53 / KMS charges for the project.
+**`scripts/teardown.sh`** deletes, in order:
+1. the global endpoint stack — its managed replication rules sit on both buses, and a bus with
+   rules can't be deleted;
+2. the Cognito replica (switched to `INACTIVE` first — only inactive replicas can be deleted);
+3. the us-west-2 stack (it only references the replicas; its KMS replica key is scheduled for
+   deletion);
+4. the us-east-1 stack (global tables + replicas, user pool, KMS key — 7-day deletion window).
+
+It deliberately **keeps** the CI bootstrap stack (IAM roles cost nothing, and the GitHub secrets
+stay valid for a rebuild) and the shared SAM artifact buckets. While the stacks don't exist, pushes
+to `main` run the tests and **skip the deploy** (CI notice "Infrastructure is torn down"), so
+nothing is half-created or billed by accident. To remove CI access as well:
+`aws cloudformation delete-stack --stack-name aws-event-driven-application-github-oidc` and delete
+the two repository secrets.
+
+**`scripts/rebuild.sh`** recreates the deployment from the templates, reading every changing id
+(KMS key, user pool and app client, global endpoint) from stack outputs — nothing is hard-coded:
+primary stack → activate the Cognito replica → secondary stack → global endpoint stack → both app
+stacks again with the endpoint id → test users (created in the primary, replicated) and the local
+credential files `~/.orders-event-driven-test-user*.env` → smoke tests in both regions. After that,
+CI deploys on every push again. Order data starts empty; `scripts/dr_test.py normal` places test
+orders end to end.
 
 ## Design decisions
 

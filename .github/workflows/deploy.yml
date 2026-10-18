@@ -61,22 +61,38 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # After scripts/teardown.sh the stacks don't exist: skip the deploy instead of failing or
+      # half-creating a multi-region deployment (scripts/rebuild.sh rebuilds it in order)
+      - name: Check the deployment exists
+        run: |
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1 &&              aws cloudformation describe-stacks --stack-name "$STACK_NAME-global-endpoint" >/dev/null 2>&1; then
+            echo "DEPLOYED=true" >> "$GITHUB_ENV"
+          else
+            echo "DEPLOYED=false" >> "$GITHUB_ENV"
+            echo "::notice::Infrastructure is torn down - skipping deploy (run scripts/rebuild.sh to recreate it)"
+          fi
+
       - name: Validate template
+        if: env.DEPLOYED == 'true'
         run: sam validate --lint --config-env ci
 
       # Exercise 9: awscrt (SigV4a for the EventBridge global endpoint) as a Linux arm64 layer
       - name: Build CRT layer
+        if: env.DEPLOYED == 'true'
         run: bash scripts/build_crt_layer.sh
 
       - name: Build (packages the Lambda code - one build, deployed to both regions)
+        if: env.DEPLOYED == 'true'
         run: sam build --config-env ci
 
       - name: Look up the global endpoint id
+        if: env.DEPLOYED == 'true'
         run: |
           echo "ENDPOINT_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME-global-endpoint" --query "Stacks[0].Outputs[?OutputKey=='EndpointId'].OutputValue" --output text)" >> "$GITHUB_ENV"
 
       # The primary region first: it owns the global tables, the user pool and its replica
       - name: Deploy primary region (us-east-1)
+        if: env.DEPLOYED == 'true'
         run: >
           sam deploy --config-env ci
           --no-confirm-changeset
@@ -85,15 +101,18 @@ jobs:
           --parameter-overrides AppVersion=${{ github.sha }} GlobalEndpointId=${{ env.ENDPOINT_ID }}
 
       - name: Smoke test primary region
+        if: env.DEPLOYED == 'true'
         run: bash scripts/smoke_test.sh us-east-1
 
       - name: Look up the primary stack's outputs the secondary depends on
+        if: env.DEPLOYED == 'true'
         run: |
           for key in UserPoolKeyArn UserPoolId UserPoolClientId; do
             echo "PRIMARY_$key=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text)" >> "$GITHUB_ENV"
           done
 
       - name: Deploy secondary region (us-west-2)
+        if: env.DEPLOYED == 'true'
         run: >
           sam deploy --config-env ci-dr
           --no-confirm-changeset
@@ -105,4 +124,5 @@ jobs:
           PrimaryUserPoolClientId=${{ env.PRIMARY_UserPoolClientId }}
 
       - name: Smoke test secondary region
+        if: env.DEPLOYED == 'true'
         run: bash scripts/smoke_test.sh us-west-2
