@@ -1,0 +1,6 @@
+{
+  "httpMethod": "POST",
+  "path": "/orders",
+  "headers": {"Content-Type": "application/json"},
+  "body": "{\"items\": [{\"itemId\": \"SKU-1001\", \"productName\": \"Wireless Mouse\", \"quantity\": 2, \"unitPrice\": 24.99}, {\"itemId\": \"SKU-2002\", \"productName\": \"USB-C Hub\", \"quantity\": 1, \"unitPrice\": 49.50}]}"
+}

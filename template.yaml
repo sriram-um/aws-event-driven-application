@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Project 4 - Event-driven Orders application (API Gateway, Lambda, DynamoDB, Cognito,
+  EventBridge, SQS, SNS, CloudWatch).
+
+Parameters:
+  PowertoolsLayerArn:
+    Type: String
+    Description: >
+      Powertools for AWS Lambda (Python) layer, pinned. Latest is published at SSM
+      /aws/service/powertools/python/arm64/python3.12/latest
+    Default: arn:aws:lambda:us-east-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:39
+  AppVersion:
+    Type: String
+    Description: Deployed version (the CI pipeline passes the git commit SHA)
+    Default: local
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    MemorySize: 256
+    Timeout: 10
+    # X-Ray active tracing (SAM adds the xray:Put* permissions)
+    Tracing: Active
+    Layers:
+      - !Ref PowertoolsLayerArn
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: orders
+        POWERTOOLS_LOG_LEVEL: INFO
+        APP_VERSION: !Ref AppVersion
+    Tags:
+      project: event-driven-orders
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Exercise 0 (baseline): Orders table - one header item (sk = ORDER) plus one
+  # item per order line (sk = ITEM#<itemId>) under the same orderId
+  # ---------------------------------------------------------------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  # ---------------------------------------------------------------------------
+  # Exercise 0 (baseline): CreateOrder Lambda behind POST /orders
+  # ---------------------------------------------------------------------------
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-CreateOrder'
+      Description: Validates orders and saves them to the Orders table
+      CodeUri: src/create_order/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      Policies:
+        # Least privilege: write actions on this table only (TransactWriteItems is
+        # authorised per contained PutItem)
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrdersApi
+            Path: /orders
+            Method: POST
+
+  CreateOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CreateOrderFunction}'
+      RetentionInDays: 14
+
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      Description: Orders REST API
+      StageName: prod
+      # Setting OpenApiVersion stops SAM from also creating an extra default "Stage" stage
+      OpenApiVersion: '3.0.1'
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      Auth:
+        # Secure by default: every route requires a valid Cognito ID token
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 100
+          MetricsEnabled: true
+      Tags:
+        project: event-driven-orders
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      # No public self sign-up: users are created by an admin
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolTags:
+        project: event-driven-orders
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH   # lets the CLI fetch tokens for testing
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: days
+
+Outputs:
+  OrdersTableName:
+    Description: Name of the Orders DynamoDB table
+    Value: !Ref OrdersTable
+  ApiUrl:
+    Description: Base URL of the prod stage (POST {ApiUrl}/orders)
+    Value: !Sub 'https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  ApiId:
+    Description: REST API id
+    Value: !Ref OrdersApi
+  UserPoolId:
+    Description: Cognito User Pool id
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito app client id (used to obtain tokens)
+    Value: !Ref UserPoolClient
+  CreateOrderFunctionName:
+    Description: Name of the CreateOrder Lambda function
+    Value: !Ref CreateOrderFunction

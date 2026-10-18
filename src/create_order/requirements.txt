@@ -1,0 +1,2 @@
+# boto3 is provided by the Lambda Python runtime and aws-lambda-powertools by the
+# Powertools layer (see template.yaml) - nothing to bundle.

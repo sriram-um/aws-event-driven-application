@@ -1,0 +1,47 @@
+version = 0.1
+
+# ---------------------------------------------------------------------------
+# "default" config env - local use. The profile is pinned on purpose: the shell
+# environment may set AWS_PROFILE to an unrelated account, and SAM would follow it.
+# ---------------------------------------------------------------------------
+[default.global.parameters]
+stack_name = "orders-event-driven-app"
+profile = "default"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "orders-event-driven-app"
+tags = "project=\"event-driven-orders\""
+
+# ---------------------------------------------------------------------------
+# "ci" config env - GitHub Actions (sam ... --config-env ci). No profile:
+# credentials come from the OIDC role via environment variables.
+# ---------------------------------------------------------------------------
+[ci.global.parameters]
+stack_name = "orders-event-driven-app"
+region = "us-east-1"
+
+[ci.build.parameters]
+parallel = true
+
+[ci.validate.parameters]
+lint = true
+
+[ci.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "orders-event-driven-app"
+tags = "project=\"event-driven-orders\""
