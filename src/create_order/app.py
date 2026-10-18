@@ -161,6 +161,17 @@ def _publish_order_created(order_id, customer_id, items, total, created_at):
 
 
 def record_handler(record: SQSRecord):
+    try:
+        _process(record)
+    except Exception:
+        # Reported to SQS as a batch item failure; after 3 receives SQS moves it to the DLQ
+        logger.exception("order processing failed", extra={
+            "messageId": record.message_id,
+            "receiveCount": int(record.attributes.approximate_receive_count)})
+        raise
+
+
+def _process(record: SQSRecord):
     # Set by the API Gateway mapping template: orderId (validated UUID from the path),
     # customerId (verified Cognito sub), acceptedAt (request time, epoch ms), requestId
     order_id = _attribute(record, "orderId")

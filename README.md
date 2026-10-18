@@ -23,7 +23,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 4 | Monitoring | CloudWatch dashboard | ✅ Done |
 | 5 | CI/CD | GitHub Actions (OIDC) | ✅ Done |
 | 6 | Asynchronous API | API Gateway → SQS | ✅ Done |
-| 7 | Dead-letter queues | SQS | ⬜ |
+| 7 | Dead-letter queues | SQS | ✅ Done |
 | 8 | Idempotency | Lambda, DynamoDB conditional writes | ⬜ |
 | 9 | Disaster recovery | EventBridge Global Endpoints | ⬜ |
 | 10 | Cost estimate | AWS Pricing Calculator | ⬜ |
@@ -102,6 +102,27 @@ short notification (built by an EventBridge **input transformer**) to the SNS to
 queue subscribed with raw message delivery stands in for real subscribers (email, SMS,
 webhooks, other services) so delivery can be checked from the CLI.
 
+**Failure handling (exercise 7):**
+
+```
+ order-intake ──(3 failed receives)──► order-intake-dlq ─┐
+ fulfilment   ──(3 failed receives)──► fulfilment-dlq   ─┼─► CloudWatch alarm "<dlq>-not-empty" ──► SNS ops-alerts
+ rule targets ──(185 retries / 24 h)─► event-targets-dlq ┘
+        ▲                                     │
+        └──── redrive (SQS StartMessageMoveTask, back to the original queue) ◄──┘
+```
+
+- **Consumer DLQs** — both source queues have `RedrivePolicy {maxReceiveCount: 3}`: a message
+  CreateOrder/FulfilOrder fails to process three times (exception → batch item failure → visible
+  again after the 60 s visibility timeout) is moved to its DLQ instead of being retried until the
+  4-day retention expires. DLQs keep messages 14 days; `RedriveAllowPolicy` lets only the
+  matching source queue use each DLQ.
+- **Event-target DLQ** — each EventBridge rule target has a `DeadLetterConfig` and an explicit
+  retry policy: events EventBridge can't *deliver* (missing permission, deleted target, …) land
+  there instead of being dropped.
+- **Alarms** — one per DLQ (`ApproximateNumberOfMessagesVisible > 0`), sending to the
+  `ops-alerts` SNS topic (no subscriber by default; subscribe an email to be paged).
+
 **Observability:** X-Ray active tracing on the API stage and the Lambdas; structured JSON logs
 (Powertools `Logger`, correlation id = API Gateway request id, `app_version` key); a copy of
 every event in `/aws/events/<stack>`; and the CloudWatch dashboard
@@ -117,6 +138,9 @@ every event in `/aws/events/<stack>`; and the CloudWatch dashboard
 | Lambda — Invocations & Errors | CreateOrder and FulfilOrder |
 | API Gateway — requests & errors | `Count`, `4XXError`, `5XXError` (stage `prod`) |
 | Duration p90 | API Gateway `Latency`, Lambda `Duration` for both functions |
+| Dead-letter queues | Messages waiting in the 3 DLQs + the 3 DLQ alarms |
+
+![Dead-letter queues widget, 15:38-16:08 UTC: the fulfilment DLQ holds 1 message from 15:56 to 16:00 (the message the first redrive missed); the intake and event-target DLQs stay at 0](docs/images/dashboard-dead-letter-queues-messages-waiting.png)
 
 | EventBridge `MatchedEvents` | SQS `NumberOfMessagesSent` | SNS `NumberOfMessagesPublished` |
 |---|---|---|
@@ -202,6 +226,7 @@ src/fulfil_order/app.py       FulfilOrder Lambda handler (SQS → DynamoDB → E
 scripts/measure_fulfilment.py Sends N orders and breaks down the async fulfilment latency
 scripts/check_notifications.py Sends N orders and reads the SNS notifications from the test queue
 scripts/check_dashboard.py    Checks every dashboard metric has data; renders widgets to docs/images/
+scripts/dlq_demo.py           DLQ demos: poison messages, and a consumer outage + redrive
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
@@ -341,6 +366,18 @@ one per account, so the template references its ARN instead of creating it.
 - **Status endpoint as a second direct integration (`BatchGetItem`)** — one call reads both
   tables; ownership is enforced in the response template (`customerId` must equal the caller's
   `sub`, otherwise 404 — no difference between "not yours" and "doesn't exist").
+- **`maxReceiveCount: 3` with a 60 s visibility timeout** — a failing message is retried three
+  times about a minute apart, then parked: poison messages stop consuming Lambda invocations and
+  don't hide behind retries, while a transient error still gets three chances.
+- **Permanent vs transient failures handled differently** — payload problems CreateOrder can
+  detect (duplicate `itemId`) are *consumed* and stored as `REJECTED` (a DLQ wouldn't help — a
+  retry can't fix them); unexpected errors (missing attributes, AWS errors, bugs) raise and end up
+  in the DLQ, where they can be inspected and redriven after a fix.
+- **DLQ retention 14 days > source retention 4 days** — SQS keeps the *original* enqueue time
+  when it moves a message, so a DLQ with the same retention would expire messages soon after
+  they arrive.
+- **Separate DLQ for EventBridge delivery failures** — a different failure (event never reached
+  the queue/topic) with different handling (fix the target/permissions, then re-publish).
 - **EventBridge → SQS → Lambda instead of EventBridge → Lambda directly** — the queue buffers
   bursts, controls consumer concurrency, keeps messages for 4 days if the consumer is broken, and
   gives a place for a dead-letter queue (exercise 7).
@@ -566,3 +603,53 @@ window mixes PUT and GET calls and includes 400/401 responses that never reach a
   unit tests.
 - Schema errors include noise such as `format attribute "int32" not supported` — the message is
   API Gateway's validator output, returned as-is via the `BAD_REQUEST_BODY` gateway response.
+
+### Exercise 7 — dead-letter queues (measured 2026-10-18, us-east-1)
+
+`scripts/dlq_demo.py`, against the deployed stack:
+
+**Poison messages** (intake: message without the API's attributes; fulfilment: body not JSON):
+
+| Attempt | CreateOrder (intake) | FulfilOrder (fulfilment) |
+|---|---|---|
+| 1 | +0 s `message attribute 'orderId' is missing` | +0 s `message body is not JSON` |
+| 2 | +59 s | +59 s |
+| 3 | +119 s | +119 s |
+| Moved to DLQ | ~186 s after sending (same `MessageId`) | ~186 s |
+
+Exactly three processing attempts, one visibility timeout (60 s) apart, then SQS moved the message
+on the next receive. In the DLQ `ApproximateReceiveCount` reads 4 (3 in the source queue + the
+receive used to inspect it — the counter carries over).
+
+**Consumer outage + redrive** (FulfilOrder reserved concurrency set to 0, so every invocation is
+throttled; real orders through the API; concurrency restored in a `finally` block):
+
+| Step | Run 1 (3 orders) | Run 2 (5 orders) |
+|---|---|---|
+| Orders in the fulfilment DLQ | after 191 s | after 191 s |
+| Orders fulfilled during the outage | 0 | 0 |
+| Redrive (`StartMessageMoveTask` → original queue) | task moved **2 of 3**; a second task moved the last one | 1 task moved 5 |
+| Redriven orders fulfilled | yes — 3/3 | all 5 within **10 s** of the redrive |
+| Alarm `fulfilment-dlq-not-empty` | OK → **ALARM** ~3 min after the messages arrived (11:55:34 → 11:58:30 local), back to OK after the DLQ emptied | did not fire (messages left the DLQ within seconds) |
+
+**Lessons:**
+
+- **Throttling counts as a failed receive.** With the function throttled, the event source
+  mapping still receives each message, can't invoke, and the message comes back after the
+  visibility timeout — so an *outage* (or a too-low concurrency limit) drains healthy orders into
+  the DLQ after `maxReceiveCount` attempts. That's why DLQ + redrive matters: nothing was lost,
+  and the orders were fulfilled once the consumer was back.
+- **A message move task moves an approximate count.** One task reported
+  `ApproximateNumberOfMessagesToMove: 2` for 3 messages and left one behind. After a redrive,
+  check the DLQ is really empty (receive, don't trust the counter) and start another task if
+  needed — `dlq_demo.py` now loops until it is.
+- **`ApproximateNumberOfMessages` is eventually consistent:** right after a redrive the DLQ
+  reported 0, 0, then 5 in consecutive reads while a receive returned no messages.
+- **Short DLQ stays don't trip the alarm.** SQS metrics are 1-minute samples published with a
+  delay; messages that were in a DLQ for a few seconds (poison demo, run 2) never showed on the
+  graph and the alarm stayed OK. The alarm only fired for the message that waited ~5 minutes —
+  about 3 minutes after it arrived. Fine for "someone must look at this", not for instant paging.
+- The EventBridge target DLQ is configured on all three targets (verified with
+  `list-targets-by-rule`) but wasn't exercised — making a target fail means breaking its
+  permissions on the live stack.
+- Cost: 3 standard alarms ≈ $0.30/month; DLQs and the alerts topic cost nothing while empty.

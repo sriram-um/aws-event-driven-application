@@ -336,6 +336,10 @@ Resources:
       SqsManagedSseEnabled: true
       VisibilityTimeout: 60            # 6x the CreateOrder timeout (10 s)
       MessageRetentionPeriod: 345600   # 4 days
+      # Exercise 7: after 3 failed processing attempts the message moves to the DLQ
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderIntakeDLQ.Arn
+        maxReceiveCount: 3
       Tags:
         - Key: project
           Value: event-driven-orders
@@ -442,6 +446,12 @@ Resources:
       Targets:
         - Id: order-events-log-group
           Arn: !GetAtt OrderEventsLogGroup.Arn
+          # Exercise 7: undeliverable events (after retries) go to the event-targets DLQ
+          RetryPolicy:
+            MaximumRetryAttempts: 185        # EventBridge default, stated explicitly
+            MaximumEventAgeInSeconds: 86400  # 24 h
+          DeadLetterConfig:
+            Arn: !GetAtt EventTargetsDLQ.Arn
 
   # ---------------------------------------------------------------------------
   # Exercise 2: OrderCreated -> SQS fulfilment queue -> FulfilOrder Lambda -> Fulfilments table
@@ -474,6 +484,10 @@ Resources:
       # isn't redelivered while a batch (incl. retries/throttling) is still in flight
       VisibilityTimeout: 60
       MessageRetentionPeriod: 345600   # 4 days
+      # Exercise 7: after 3 failed processing attempts the message moves to the DLQ
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FulfilmentDLQ.Arn
+        maxReceiveCount: 3
       Tags:
         - Key: project
           Value: event-driven-orders
@@ -511,6 +525,12 @@ Resources:
       Targets:
         - Id: fulfilment-queue
           Arn: !GetAtt FulfilmentQueue.Arn
+          # Exercise 7: undeliverable events (after retries) go to the event-targets DLQ
+          RetryPolicy:
+            MaximumRetryAttempts: 185        # EventBridge default, stated explicitly
+            MaximumEventAgeInSeconds: 86400  # 24 h
+          DeadLetterConfig:
+            Arn: !GetAtt EventTargetsDLQ.Arn
 
   FulfilOrderFunction:
     Type: AWS::Serverless::Function
@@ -594,6 +614,12 @@ Resources:
       Targets:
         - Id: order-notifications-topic
           Arn: !Ref OrderNotificationsTopic
+          # Exercise 7: undeliverable events (after retries) go to the event-targets DLQ
+          RetryPolicy:
+            MaximumRetryAttempts: 185        # EventBridge default, stated explicitly
+            MaximumEventAgeInSeconds: 86400  # 24 h
+          DeadLetterConfig:
+            Arn: !GetAtt EventTargetsDLQ.Arn
           # Subscribers get a small, stable notification - not the full order (items, prices)
           InputTransformer:
             InputPathsMap:
@@ -781,6 +807,25 @@ Resources:
                     [ "...", "${FulfilOrderFunction}", { "label": "FulfilOrder" } ]
                   ]
                 }
+              },
+              {
+                "type": "metric", "x": 0, "y": 20, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Dead-letter queues - messages waiting",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+                  "metrics": [
+                    [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${IntakeDLQName}", { "label": "intake DLQ (CreateOrder failed 3x)", "color": "#d62728" } ],
+                    [ "...", "${FulfilmentDLQName}", { "label": "fulfilment DLQ (FulfilOrder failed 3x)", "color": "#ff7f0e" } ],
+                    [ "...", "${EventTargetsDLQName}", { "label": "event targets DLQ (undeliverable)", "color": "#9467bd" } ]
+                  ]
+                }
+              },
+              {
+                "type": "alarm", "x": 12, "y": 20, "width": 12, "height": 6,
+                "properties": {
+                  "title": "DLQ alarms",
+                  "alarms": [ "${OrderIntakeDLQAlarm.Arn}", "${FulfilmentDLQAlarm.Arn}", "${EventTargetsDLQAlarm.Arn}" ]
+                }
               }
             ]
           }
@@ -789,9 +834,153 @@ Resources:
           NotificationsRule: !Sub '${AWS::StackName}-order-notifications'
           LogsRule: !Sub '${AWS::StackName}-all-order-events-to-logs'
           IntakeQueueName: !GetAtt OrderIntakeQueue.QueueName
+          IntakeDLQName: !GetAtt OrderIntakeDLQ.QueueName
+          FulfilmentDLQName: !GetAtt FulfilmentDLQ.QueueName
+          EventTargetsDLQName: !GetAtt EventTargetsDLQ.QueueName
           FulfilmentQueueName: !GetAtt FulfilmentQueue.QueueName
           TestQueueName: !GetAtt NotificationsTestQueue.QueueName
           TopicName: !GetAtt OrderNotificationsTopic.TopicName
+
+  # ---------------------------------------------------------------------------
+  # Exercise 7: dead-letter queues + alarms
+  # ---------------------------------------------------------------------------
+  # Messages that failed 3 processing attempts. Retention is the SQS maximum (14 days) so there
+  # is time to investigate and redrive; the original enqueue timestamp is kept when a message
+  # moves, so a DLQ's retention must be longer than its source queue's (4 days).
+  OrderIntakeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-order-intake-dlq'
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600   # 14 days
+      # Only the intake queue may use this DLQ (and redrive back to it). The source ARN is built
+      # from the name: !GetAtt would create a circular dependency with its RedrivePolicy.
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-order-intake'
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  FulfilmentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-fulfilment-dlq'
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600   # 14 days
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-fulfilment'
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  # Events EventBridge could not deliver to a rule target (after its retry policy) - a
+  # different failure from the consumer DLQs above: here the message never reached the target.
+  EventTargetsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-event-targets-dlq'
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600   # 14 days
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  EventTargetsDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventTargetsDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventTargetsDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt OrderCreatedToFulfilmentRule.Arn
+                  - !GetAtt OrderNotificationsRule.Arn
+                  - !GetAtt OrderEventsToLogsRule.Arn
+
+  # Alarm destination for operators (no subscription by default - add e.g. an email endpoint)
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-ops-alerts'
+      DisplayName: Orders ops alerts
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  OrderIntakeDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-order-intake-dlq-not-empty'
+      AlarmDescription: Orders failed 3 CreateOrder attempts and are waiting in the intake DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderIntakeDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+      OKActions:
+        - !Ref OpsAlertsTopic
+
+  FulfilmentDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-fulfilment-dlq-not-empty'
+      AlarmDescription: OrderCreated messages failed 3 FulfilOrder attempts and are in the fulfilment DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FulfilmentDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+      OKActions:
+        - !Ref OpsAlertsTopic
+
+  EventTargetsDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-event-targets-dlq-not-empty'
+      AlarmDescription: EventBridge could not deliver events to a rule target
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventTargetsDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+      OKActions:
+        - !Ref OpsAlertsTopic
 
   UserPool:
     Type: AWS::Cognito::UserPool
@@ -865,6 +1054,18 @@ Outputs:
   OrderIntakeQueueUrl:
     Description: SQS queue between API Gateway and CreateOrder
     Value: !Ref OrderIntakeQueue
+  OrderIntakeDLQUrl:
+    Description: Dead-letter queue for the intake queue
+    Value: !Ref OrderIntakeDLQ
+  FulfilmentDLQUrl:
+    Description: Dead-letter queue for the fulfilment queue
+    Value: !Ref FulfilmentDLQ
+  EventTargetsDLQUrl:
+    Description: Dead-letter queue for undeliverable EventBridge events
+    Value: !Ref EventTargetsDLQ
+  OpsAlertsTopicArn:
+    Description: SNS topic receiving the DLQ alarms (subscribe an email to get notified)
+    Value: !Ref OpsAlertsTopic
   FulfilmentsTableName:
     Description: Name of the Fulfilments DynamoDB table
     Value: !Ref FulfilmentsTable
