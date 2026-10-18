@@ -21,7 +21,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 2 | Process messages | SQS, Lambda, DynamoDB | ✅ Done |
 | 3 | Send notifications | SNS | ✅ Done |
 | 4 | Monitoring | CloudWatch dashboard | ✅ Done |
-| 5 | CI/CD | GitHub Actions (OIDC) | ⬜ |
+| 5 | CI/CD | GitHub Actions (OIDC) | ✅ Done |
 | 6 | Asynchronous API | API Gateway → SQS | ⬜ |
 | 7 | Dead-letter queues | SQS | ⬜ |
 | 8 | Idempotency | Lambda, DynamoDB conditional writes | ⬜ |
@@ -187,6 +187,8 @@ scripts/check_dashboard.py    Checks every dashboard metric has data; renders wi
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
+infra/github-oidc.yaml        One-time CI/CD bootstrap (GitHub deploy role + CloudFormation execution role)
+.github/workflows/deploy.yml  GitHub Actions: test → deploy → smoke tests
 ```
 
 ## Getting started
@@ -231,6 +233,43 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
 | `400 {"message"}` | Invalid JSON / payload (empty or >25 items, duplicate `itemId`, bad quantity/price) |
 | `401` | Missing or invalid ID token |
 | `429` | API Gateway throttling (100 rps, burst 50) |
+
+## CI/CD
+
+Every push to `main` runs [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml):
+
+```
+push to main ──► test job ──────────────► deploy job ───────────────────────────────────────────►
+                 pytest (moto, no AWS)    OIDC → assume deploy role (no stored access keys)
+                                          sam validate --lint → sam build →
+                                          sam deploy --config-env ci --role-arn <cfn-execution>
+                                                     --parameter-overrides AppVersion=<commit SHA>
+                                          smoke tests: POST /orders without token → 401;
+                                          event bus / queue / topic / dashboard outputs present
+```
+
+Pull requests run the tests only; `concurrency` prevents two deployments running at once.
+
+**AWS access without stored credentials.** The exercise asks for "AWS credentials stored as GitHub
+repository secrets"; instead of access keys, the secrets hold only two **role ARNs**, and GitHub's
+OIDC token is exchanged for short-lived credentials (1 h max):
+
+| Secret | Role | Can do |
+|---|---|---|
+| `AWS_DEPLOY_ROLE_ARN` | `aws-event-driven-application-github-deploy` | Assumable **only** by workflows on `main` of this repo (trust on the immutable-ID subject `repo:sriram-um@93265789/aws-event-driven-application@1424480922:ref:refs/heads/main`). Change sets on `orders-event-driven-app` only, SAM artifact bucket, `iam:PassRole` of the execution role. |
+| `AWS_CFN_EXECUTION_ROLE_ARN` | `aws-event-driven-application-cfn-execution` | AdministratorAccess, but assumable only by `cloudformation.amazonaws.com` — CloudFormation makes the resource changes, GitHub never holds admin credentials. |
+
+Both roles come from the bootstrap stack `aws-event-driven-application-github-oidc`
+([`infra/github-oidc.yaml`](infra/github-oidc.yaml)), deployed once by hand:
+
+```bash
+aws cloudformation deploy --template-file infra/github-oidc.yaml \
+  --stack-name aws-event-driven-application-github-oidc --capabilities CAPABILITY_NAMED_IAM
+```
+
+The account's GitHub OIDC provider already existed (created by Project 3) and there can only be
+one per account, so the template references its ARN instead of creating it.
+`samconfig.toml` has a `ci` config env without a `profile` (credentials come from the OIDC step).
 
 ## Design decisions
 
@@ -282,6 +321,11 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
 - **`FILL(m, 0)` metric math for sparse metrics** — EventBridge, SNS and Lambda publish no
   datapoint for idle minutes, so CloudWatch draws a straight line between bursts (looks like
   steady traffic). SQS publishes zeros, so it doesn't need it.
+- **GitHub OIDC + two roles instead of access keys in secrets** — nothing long-lived to leak or
+  rotate; the deploy role is pinned to one repo/branch by numeric ids, and admin rights stay with
+  the CloudFormation service.
+- **Commit SHA as `AppVersion`** — every log line carries `app_version`, so a log entry can be
+  traced to the exact commit that produced it.
 - **Log-group rule as a debug/audit trail** — makes every event visible (and queryable with Logs
   Insights) before any consumer exists. Log targets must be under `/aws/events/` and need a
   CloudWatch Logs **resource policy** allowing `events.amazonaws.com`.
@@ -394,3 +438,25 @@ order header, SQS `SentTimestamp` / `ApproximateFirstReceiveTimestamp`, and `ful
 - Metrics appear 1–3 minutes after the traffic.
 - Cost: CloudWatch's free tier includes 3 dashboards (up to 50 metrics each) per account;
   beyond that a dashboard is $3/month. Standard AWS service metrics are free.
+
+
+### Exercise 5 — CI/CD (2026-10-18)
+
+| First run ([#39138082165](https://github.com/sriram-um/aws-event-driven-application/actions/runs/39138082165)) | Duration |
+|---|---|
+| `test` job (install deps 10 s, pytest 6 s) | 22 s |
+| `deploy` job total | 66 s |
+| — OIDC credentials | 1 s |
+| — `sam validate --lint` / `sam build` | 3 s / 2 s |
+| — `sam deploy` (Lambda code + `APP_VERSION` update) | 44 s |
+| — smoke tests | 4 s + 3 s |
+| **Push → deployed** | **~1 min 40 s** |
+
+- Passed on the first run — the OIDC trust (immutable-ID subject), the separate `ci` samconfig
+  env and the existing-provider reference were all carried over from Project 3's lessons.
+- After the CI deploy, both functions log `"app_version": "fbe77481960d…"` (the pushed commit),
+  and an end-to-end check (2 orders → 4 notifications) passed.
+- The first orders after a deploy hit cold starts: `OrderFulfilled` notification after ~1.8 s
+  instead of ~0.25 s — every deployment replaces the function versions.
+- The stack was first created with local credentials and is now updated by CloudFormation using
+  the execution role; switching roles on an existing stack needed no changes.
