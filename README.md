@@ -726,6 +726,10 @@ the Lambda log messages:
   serialized twice (`Type mismatch … expected: S actual: M`); (2) a resumed fulfilment is read
   back from DynamoDB with `Decimal` numbers, which `json.dumps` can't encode — every resume would
   have failed and ended in the DLQ.
+- **CI failed after this push**: pytest also collects `*_test.py`, so it imported
+  `scripts/idempotency_test.py`, which creates a boto3 session with the local `default` profile —
+  `ProfileNotFound` on the runner, "Interrupted: 1 error during collection" (exit code 2). Fixed with
+  `pytest.ini` (`testpaths = tests`); reproduced locally by hiding the AWS config files.
 - The 202 can't report a duplicate or a conflict — the API answers before CreateOrder runs.
   A duplicate's "existing result" is what `GET /orders/{orderId}` returns (same as the first
   request's); a conflict is visible in the logs (`ORDER_ID_CONFLICT`). A synchronous check would
