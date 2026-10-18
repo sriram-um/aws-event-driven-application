@@ -26,7 +26,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 7 | Dead-letter queues | SQS | ✅ Done |
 | 8 | Idempotency | Lambda, DynamoDB conditional writes | ✅ Done |
 | 9 | Disaster recovery | EventBridge Global Endpoints, DynamoDB global tables, Cognito multi-Region replication | ✅ Done |
-| 10 | Cost estimate | AWS Pricing Calculator | ⬜ |
+| 10 | Cost estimate | AWS Pricing Calculator | ✅ Done — [docs/cost-estimate.md](docs/cost-estimate.md) |
 
 ## Architecture (current)
 
@@ -411,6 +411,55 @@ aws cloudformation deploy --template-file infra/github-oidc.yaml \
 The account's GitHub OIDC provider already existed (created by Project 3) and there can only be
 one per account, so the template references its ARN instead of creating it.
 `samconfig.toml` has a `ci` config env without a `profile` (credentials come from the OIDC step).
+
+## Cost
+
+Details in [docs/cost-estimate.md](docs/cost-estimate.md) (list prices from the AWS Price List API).
+
+| | 100 k orders, 5 k MAU | 1 M orders, 50 k MAU | Idle |
+|---|---|---|---|
+| Event pipeline + API + data (both regions) | ≈ $4.70 | ≈ $37 | ≈ $1 (SQS polling) |
+| Fixed (dashboards, detailed metrics, alarms, KMS, health check) | ≈ $17.60 | ≈ $17.60 | ≈ $3 |
+| Cognito (Essentials + multi-Region replication) | $22.50 | ≈ $825 | < $0.01 |
+| **Total / month** | **≈ $47** | **≈ $895** | **≈ $4** |
+
+The event-driven core (EventBridge, SQS, SNS and both Lambdas) costs under $2 per 100,000
+orders, including cross-region replication. Identity DR (Cognito multi-Region replication) and
+per-method API metrics dominate.
+
+## Teardown
+
+Delete in this order — each step depends on the previous one:
+
+```bash
+export AWS_PROFILE=default
+# 1. Global endpoint first: its managed replication rules sit on both buses, and a bus with
+#    rules can't be deleted
+aws cloudformation delete-stack --region us-east-1 --stack-name orders-event-driven-app-global-endpoint
+aws cloudformation wait stack-delete-complete --region us-east-1 --stack-name orders-event-driven-app-global-endpoint
+
+# 2. Cognito replica must be INACTIVE before it can be deleted
+python scripts/activate_user_pool_replica.py INACTIVE
+
+# 3. Secondary region (it only references the replicas; deletes its KMS replica key - 7-day wait)
+sam delete --config-env dr --no-prompts
+
+# 4. Primary region: global tables and their replicas, user pool + replica, KMS key
+#    (scheduled for deletion after 7 days, once its replica is gone)
+sam delete --no-prompts
+
+# 5. CI/CD bootstrap roles
+aws cloudformation delete-stack --region us-east-1 --stack-name aws-event-driven-application-github-oidc
+```
+
+Then check:
+- `aws kms list-keys` / the KMS console: both keys show `PendingDeletion` (or
+  `PendingReplicaDeletion`) — they stop billing once deleted.
+- DynamoDB in both regions: no `orders-event-driven-app-*` tables.
+- The SAM artifact buckets `aws-sam-cli-managed-default-*` in both regions are shared with other
+  projects (us-east-1 with Project 3) — empty the `orders-event-driven-app/` prefix only.
+- GitHub: remove the repository secrets `AWS_DEPLOY_ROLE_ARN` / `AWS_CFN_EXECUTION_ROLE_ARN`.
+- Billing → Bills the next day: no remaining `us-west-2` / Route 53 / KMS charges for the project.
 
 ## Design decisions
 
