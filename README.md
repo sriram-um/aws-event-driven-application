@@ -120,10 +120,12 @@ every event in `/aws/events/<stack>`; and the CloudWatch dashboard
 
 | EventBridge `MatchedEvents` | SQS `NumberOfMessagesSent` | SNS `NumberOfMessagesPublished` |
 |---|---|---|
-| ![EventBridge MatchedEvents per rule: three bursts of orders at 14:25, 14:30 and 14:39; the all-events rule peaks at twice the OrderCreated rule](docs/images/dashboard-eventbridge-matchedevents-per-rule.png) | ![SQS NumberOfMessagesSent: fulfilment queue and notifications test queue spike with each burst](docs/images/dashboard-sqs-numberofmessagessent.png) | ![SNS published, delivered and failed: published equals delivered, failed stays at 0](docs/images/dashboard-sns-numberofmessagespublished.png) |
+| ![EventBridge MatchedEvents per rule, 15:14-15:34 UTC: bursts at 15:25 and 15:31; the all-events and SNS rules peak at about twice the OrderCreated rule](docs/images/dashboard-eventbridge-matchedevents-per-rule.png) | ![SQS NumberOfMessagesSent, same window: the intake and fulfilment queue lines overlap, and the notifications test queue peaks at twice their height](docs/images/dashboard-sqs-numberofmessagessent.png) | ![SNS NumberOfMessagesPublished, same window: published and delivered overlap at every burst, failed stays at 0](docs/images/dashboard-sns-numberofmessagespublished.png) |
 
 Images rendered from the deployed dashboard with `scripts/check_dashboard.py --images`
-(CloudWatch `GetMetricWidgetImage`).
+(CloudWatch `GetMetricWidgetImage`). Window: exercise 6 tests (15:20) and two 20-order bursts; over those
+20 minutes 64 orders reached the intake queue and 62 the fulfilment queue — the other two were
+the rejected order (duplicate `itemId`) and a duplicate `orderId` CreateOrder skipped.
 
 ## Data model
 
