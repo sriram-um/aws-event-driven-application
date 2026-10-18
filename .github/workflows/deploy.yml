@@ -1,0 +1,93 @@
+name: Test and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deployments of the stack at the same time
+concurrency:
+  group: deploy-orders-event-driven-app
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: orders-event-driven-app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Unit tests
+        run: pytest -q
+
+  deploy:
+    needs: test
+    # Pull requests only run the tests; deployments happen from main
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required to request the GitHub OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template
+        run: sam validate --lint --config-env ci
+
+      - name: Build (packages the Lambda code)
+        run: sam build --config-env ci
+
+      - name: Deploy (uploads code to S3 and updates the stack)
+        run: >
+          sam deploy --config-env ci
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+          --role-arn ${{ secrets.AWS_CFN_EXECUTION_ROLE_ARN }}
+          --parameter-overrides AppVersion=${{ github.sha }}
+
+      - name: Smoke test - unauthenticated request must be rejected
+        run: |
+          API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/orders" -d '{}')
+          echo "POST /orders without token -> HTTP $code"
+          test "$code" = "401"
+
+      - name: Smoke test - event-driven resources are in the stack outputs
+        run: |
+          for key in EventBusName FulfilmentQueueUrl OrderNotificationsTopicArn DashboardUrl; do
+            value=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text)
+            echo "$key = $value"
+            test -n "$value" && test "$value" != "None"
+          done

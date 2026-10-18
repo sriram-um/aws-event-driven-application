@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  One-time bootstrap for GitHub Actions CI/CD: a deploy role that GitHub Actions assumes through
+  the account's existing GitHub OIDC provider (no long-lived access keys), and a CloudFormation
+  execution role. Deploy manually once:
+    aws cloudformation deploy --template-file infra/github-oidc.yaml
+      --stack-name aws-event-driven-application-github-oidc --capabilities CAPABILITY_NAMED_IAM
+
+Parameters:
+  GitHubOidcProviderArn:
+    Type: String
+    Description: >
+      The account's GitHub OIDC provider. There can only be one per account; it was created by
+      the Project 3 bootstrap stack, so it is referenced here instead of created.
+    Default: arn:aws:iam::977534234172:oidc-provider/token.actions.githubusercontent.com
+  GitHubOrg:
+    Type: String
+    Default: sriram-um
+  GitHubOrgId:
+    Type: String
+    Description: Numeric GitHub owner id (https://api.github.com/users/<org> -> id)
+    Default: '93265789'
+  GitHubRepo:
+    Type: String
+    Default: aws-event-driven-application
+  GitHubRepoId:
+    Type: String
+    Description: Numeric GitHub repository id (https://api.github.com/repos/<org>/<repo> -> id)
+    Default: '1424480922'
+  Branch:
+    Type: String
+    Default: main
+  AppStackName:
+    Type: String
+    Default: orders-event-driven-app
+  ArtifactBucketName:
+    Type: String
+    Description: SAM-managed artifact bucket (output SourceBucket of stack aws-sam-cli-managed-default)
+    Default: aws-sam-cli-managed-default-samclisourcebucket-2xqpmzurmekw
+
+Resources:
+  # Assumed by GitHub Actions. Can only drive CloudFormation for the app stack and upload
+  # artifacts; the actual resource changes are made by CloudFormation with the execution role.
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${GitHubRepo}-github-deploy'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Only workflows running on the main branch of this repository. GitHub's
+                # immutable-ID subject format pins the numeric owner/repo ids, so a re-created
+                # repo with the same name cannot assume this role.
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${Branch}'
+      Policies:
+        - PolicyName: sam-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AppStackChangeSets
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*'
+              - Sid: SamTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+              - Sid: TemplateValidation
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+              - Sid: Artifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucketName}/*'
+              - Sid: PassExecutionRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: ReadStackOutputsForSmokeTest
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: '*'
+
+  # Used by CloudFormation (not by GitHub) to create/update the app's resources. Broad by
+  # necessity - the stack manages IAM, Lambda, API Gateway, DynamoDB, Cognito, EventBridge, SQS,
+  # SNS, CloudWatch... - but only the CloudFormation service can assume it.
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${GitHubRepo}-cfn-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+Outputs:
+  GitHubDeployRoleArn:
+    Description: Store as GitHub secret AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+  CloudFormationExecutionRoleArn:
+    Description: Store as GitHub secret AWS_CFN_EXECUTION_ROLE_ARN
+    Value: !GetAtt CloudFormationExecutionRole.Arn
