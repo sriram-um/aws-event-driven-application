@@ -385,6 +385,144 @@ Resources:
       # Deliver the notification JSON as-is instead of wrapped in an SNS envelope
       RawMessageDelivery: true
 
+  # ---------------------------------------------------------------------------
+  # Exercise 4: CloudWatch dashboard - EventBridge, SQS, SNS (+ Lambda/API health)
+  # ---------------------------------------------------------------------------
+  EventsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      # Rule names are built from the stack name: !Ref on a rule on a custom bus
+      # returns "bus|rule", which isn't a valid RuleName dimension value.
+      # EventBridge, SNS and Lambda publish no datapoint for idle minutes, so those metrics
+      # are wrapped in FILL(m, 0) - otherwise the graph draws a straight line between bursts.
+      DashboardBody: !Sub
+        - |
+          {
+            "start": "-PT3H",
+            "widgets": [
+              {
+                "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+                "properties": { "markdown": "## Event-driven Orders - ${AWS::StackName}\nAPI **POST /orders** → CreateOrder → bus **${OrdersEventBus}** → rules → SQS **${FulfilmentQueueName}** → FulfilOrder · SNS **${TopicName}**" }
+              },
+              {
+                "type": "metric", "x": 0, "y": 2, "width": 8, "height": 6,
+                "properties": {
+                  "title": "EventBridge - MatchedEvents per rule",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    [ { "expression": "FILL(m1, 0)", "label": "OrderCreated → fulfilment queue", "id": "e1" } ],
+                    [ { "expression": "FILL(m2, 0)", "label": "Created/Fulfilled → SNS", "id": "e2" } ],
+                    [ { "expression": "FILL(m3, 0)", "label": "All events → CloudWatch Logs", "id": "e3" } ],
+                    [ "AWS/Events", "MatchedEvents", "EventBusName", "${OrdersEventBus}", "RuleName", "${FulfilmentRule}", { "id": "m1", "visible": false } ],
+                    [ "AWS/Events", "MatchedEvents", "EventBusName", "${OrdersEventBus}", "RuleName", "${NotificationsRule}", { "id": "m2", "visible": false } ],
+                    [ "AWS/Events", "MatchedEvents", "EventBusName", "${OrdersEventBus}", "RuleName", "${LogsRule}", { "id": "m3", "visible": false } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 8, "y": 2, "width": 8, "height": 6,
+                "properties": {
+                  "title": "SQS - NumberOfMessagesSent",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "${FulfilmentQueueName}", { "label": "fulfilment queue" } ],
+                    [ "...", "${TestQueueName}", { "label": "notifications test subscriber" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 16, "y": 2, "width": 8, "height": 6,
+                "properties": {
+                  "title": "SNS - NumberOfMessagesPublished",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    [ { "expression": "FILL(m1, 0)", "label": "published", "id": "e1" } ],
+                    [ { "expression": "FILL(m2, 0)", "label": "delivered", "id": "e2" } ],
+                    [ { "expression": "FILL(m3, 0)", "label": "failed", "id": "e3", "color": "#d62728" } ],
+                    [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${TopicName}", { "id": "m1", "visible": false } ],
+                    [ "AWS/SNS", "NumberOfNotificationsDelivered", "TopicName", "${TopicName}", { "id": "m2", "visible": false } ],
+                    [ "AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "${TopicName}", { "id": "m3", "visible": false } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 8, "width": 8, "height": 6,
+                "properties": {
+                  "title": "EventBridge - FailedInvocations per rule",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    [ { "expression": "FILL(m1, 0)", "label": "fulfilment queue", "id": "e1", "color": "#d62728" } ],
+                    [ { "expression": "FILL(m2, 0)", "label": "SNS", "id": "e2", "color": "#ff7f0e" } ],
+                    [ { "expression": "FILL(m3, 0)", "label": "CloudWatch Logs", "id": "e3", "color": "#9467bd" } ],
+                    [ "AWS/Events", "FailedInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "${FulfilmentRule}", { "id": "m1", "visible": false } ],
+                    [ "AWS/Events", "FailedInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "${NotificationsRule}", { "id": "m2", "visible": false } ],
+                    [ "AWS/Events", "FailedInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "${LogsRule}", { "id": "m3", "visible": false } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
+                "properties": {
+                  "title": "SQS - backlog (fulfilment queue)",
+                  "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                  "metrics": [
+                    [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueueName}", { "stat": "Maximum", "label": "messages waiting" } ],
+                    [ ".", "ApproximateAgeOfOldestMessage", ".", ".", { "stat": "Maximum", "label": "age of oldest (s)", "yAxis": "right" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 16, "y": 8, "width": 8, "height": 6,
+                "properties": {
+                  "title": "Lambda - Invocations & Errors",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    [ { "expression": "FILL(m1, 0)", "label": "CreateOrder invocations", "id": "e1" } ],
+                    [ { "expression": "FILL(m2, 0)", "label": "CreateOrder errors", "id": "e2", "color": "#d62728" } ],
+                    [ { "expression": "FILL(m3, 0)", "label": "FulfilOrder invocations", "id": "e3" } ],
+                    [ { "expression": "FILL(m4, 0)", "label": "FulfilOrder errors", "id": "e4", "color": "#e377c2" } ],
+                    [ "AWS/Lambda", "Invocations", "FunctionName", "${CreateOrderFunction}", { "id": "m1", "visible": false } ],
+                    [ "AWS/Lambda", "Errors", "FunctionName", "${CreateOrderFunction}", { "id": "m2", "visible": false } ],
+                    [ "AWS/Lambda", "Invocations", "FunctionName", "${FulfilOrderFunction}", { "id": "m3", "visible": false } ],
+                    [ "AWS/Lambda", "Errors", "FunctionName", "${FulfilOrderFunction}", { "id": "m4", "visible": false } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 14, "width": 12, "height": 6,
+                "properties": {
+                  "title": "API Gateway - requests & errors",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    [ "AWS/ApiGateway", "Count", "ApiName", "${ApiName}", "Stage", "prod", { "label": "requests" } ],
+                    [ ".", "4XXError", ".", ".", ".", ".", { "label": "4XX", "color": "#ff7f0e" } ],
+                    [ ".", "5XXError", ".", ".", ".", ".", { "label": "5XX", "color": "#d62728" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 12, "y": 14, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Duration p90 (ms) - API vs Lambdas",
+                  "region": "${AWS::Region}", "view": "timeSeries", "stat": "p90", "period": 60,
+                  "metrics": [
+                    [ "AWS/ApiGateway", "Latency", "ApiName", "${ApiName}", "Stage", "prod", { "label": "API Gateway latency" } ],
+                    [ "AWS/Lambda", "Duration", "FunctionName", "${CreateOrderFunction}", { "label": "CreateOrder" } ],
+                    [ "...", "${FulfilOrderFunction}", { "label": "FulfilOrder" } ]
+                  ]
+                }
+              }
+            ]
+          }
+        - ApiName: !Sub '${AWS::StackName}-api'
+          FulfilmentRule: !Sub '${AWS::StackName}-order-created-to-fulfilment'
+          NotificationsRule: !Sub '${AWS::StackName}-order-notifications'
+          LogsRule: !Sub '${AWS::StackName}-all-order-events-to-logs'
+          FulfilmentQueueName: !GetAtt FulfilmentQueue.QueueName
+          TestQueueName: !GetAtt NotificationsTestQueue.QueueName
+          TopicName: !GetAtt OrderNotificationsTopic.TopicName
+
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -469,6 +607,9 @@ Outputs:
   NotificationsTestQueueUrl:
     Description: SQS queue subscribed to the notifications topic (for testing)
     Value: !Ref NotificationsTestQueue
+  DashboardUrl:
+    Description: CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${EventsDashboard}'
   CreateOrderFunctionName:
     Description: Name of the CreateOrder Lambda function
     Value: !Ref CreateOrderFunction

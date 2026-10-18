@@ -20,7 +20,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 1 | Publish events | EventBridge | ✅ Done |
 | 2 | Process messages | SQS, Lambda, DynamoDB | ✅ Done |
 | 3 | Send notifications | SNS | ✅ Done |
-| 4 | Monitoring | CloudWatch dashboard | ⬜ |
+| 4 | Monitoring | CloudWatch dashboard | ✅ Done |
 | 5 | CI/CD | GitHub Actions (OIDC) | ⬜ |
 | 6 | Asynchronous API | API Gateway → SQS | ⬜ |
 | 7 | Dead-letter queues | SQS | ⬜ |
@@ -86,8 +86,28 @@ short notification (built by an EventBridge **input transformer**) to the SNS to
 queue subscribed with raw message delivery stands in for real subscribers (email, SMS,
 webhooks, other services) so delivery can be checked from the CLI.
 
-**Observability:** X-Ray active tracing on the API stage and the Lambda; structured JSON logs
-(Powertools `Logger`, correlation id = API Gateway request id, `app_version` key).
+**Observability:** X-Ray active tracing on the API stage and the Lambdas; structured JSON logs
+(Powertools `Logger`, correlation id = API Gateway request id, `app_version` key); a copy of
+every event in `/aws/events/<stack>`; and the CloudWatch dashboard
+`orders-event-driven-app-dashboard` (stack output `DashboardUrl`):
+
+| Widget | Metrics |
+|---|---|
+| EventBridge — MatchedEvents per rule | `AWS/Events MatchedEvents` (dims `EventBusName` + `RuleName`) for the 3 rules |
+| SQS — NumberOfMessagesSent | `AWS/SQS NumberOfMessagesSent` for the fulfilment queue and the test subscriber |
+| SNS — NumberOfMessagesPublished | `AWS/SNS NumberOfMessagesPublished`, `NumberOfNotificationsDelivered`, `NumberOfNotificationsFailed` |
+| EventBridge — FailedInvocations per rule | Target delivery failures (permissions, throttling) |
+| SQS — backlog | `ApproximateNumberOfMessagesVisible`, `ApproximateAgeOfOldestMessage` (fulfilment queue) |
+| Lambda — Invocations & Errors | CreateOrder and FulfilOrder |
+| API Gateway — requests & errors | `Count`, `4XXError`, `5XXError` (stage `prod`) |
+| Duration p90 | API Gateway `Latency`, Lambda `Duration` for both functions |
+
+| EventBridge `MatchedEvents` | SQS `NumberOfMessagesSent` | SNS `NumberOfMessagesPublished` |
+|---|---|---|
+| ![EventBridge MatchedEvents per rule: three bursts of orders at 14:25, 14:30 and 14:39; the all-events rule peaks at twice the OrderCreated rule](docs/images/dashboard-eventbridge-matchedevents-per-rule.png) | ![SQS NumberOfMessagesSent: fulfilment queue and notifications test queue spike with each burst](docs/images/dashboard-sqs-numberofmessagessent.png) | ![SNS published, delivered and failed: published equals delivered, failed stays at 0](docs/images/dashboard-sns-numberofmessagespublished.png) |
+
+Images rendered from the deployed dashboard with `scripts/check_dashboard.py --images`
+(CloudWatch `GetMetricWidgetImage`).
 
 ## Data model
 
@@ -163,6 +183,7 @@ src/create_order/app.py       CreateOrder Lambda handler (API → DynamoDB → E
 src/fulfil_order/app.py       FulfilOrder Lambda handler (SQS → DynamoDB → EventBridge)
 scripts/measure_fulfilment.py Sends N orders and breaks down the async fulfilment latency
 scripts/check_notifications.py Sends N orders and reads the SNS notifications from the test queue
+scripts/check_dashboard.py    Checks every dashboard metric has data; renders widgets to docs/images/
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
@@ -255,6 +276,12 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
   KMS key would work for ~$1/month. Messages carry ids and totals only.
 - **SQS test subscriber with raw message delivery** — scriptable verification without an
   inbox; raw delivery passes the notification JSON as-is instead of in an SNS envelope.
+- **Dashboard covers the whole event flow, not just the three required metrics** — matched
+  events → messages sent → notifications published shows where an event stopped; failed
+  invocations, queue backlog/age and Lambda errors show *why*.
+- **`FILL(m, 0)` metric math for sparse metrics** — EventBridge, SNS and Lambda publish no
+  datapoint for idle minutes, so CloudWatch draws a straight line between bursts (looks like
+  steady traffic). SQS publishes zeros, so it doesn't need it.
 - **Log-group rule as a debug/audit trail** — makes every event visible (and queryable with Logs
   Insights) before any consumer exists. Log targets must be under `/aws/events/` and need a
   CloudWatch Logs **resource policy** allowing `events.amazonaws.com`.
@@ -348,3 +375,22 @@ order header, SQS `SentTimestamp` / `ApproximateFirstReceiveTimestamp`, and `ful
 - Notifications are not ordered: SNS (standard) and EventBridge give no ordering guarantee, so a
   subscriber could see `OrderFulfilled` before `OrderCreated` under load — consumers should rely
   on `type`/`time`, not arrival order. (A FIFO topic would only help for FIFO-capable targets.)
+
+### Exercise 4 — CloudWatch dashboard (2026-10-18, us-east-1)
+
+- Verified with `scripts/check_dashboard.py`, which reads the deployed dashboard back and queries
+  every metric — a wrong dimension (e.g. a rule name typo) deploys fine but shows an empty graph.
+  After a 20-order burst all metrics had data except `FailedInvocations`, which EventBridge only
+  publishes once a failure happens (with `FILL` it now plots as 0).
+- Counts line up across the flow for the same window: 55 orders → 55 `OrderCreated` matched →
+  55 SQS messages sent → 55 FulfilOrder invocations; 50 notifications published = 50 delivered,
+  0 failed; the all-events rule matched 110 (= created + fulfilled).
+- **Gotcha:** `!Ref` on an `AWS::Events::Rule` attached to a custom bus returns
+  `bus-name|rule-name`, not the rule name — so the dashboard builds rule names with `!Sub`.
+- **Gotcha:** before `FILL`, the MatchedEvents and SNS graphs showed a straight line from
+  14:30 to 14:39 between two bursts; SQS (which emits zeros) correctly showed two spikes.
+- The SNS rule and the all-events rule have identical counts (both match created + fulfilled),
+  so their lines overlap on the MatchedEvents graph; likewise SNS published/delivered.
+- Metrics appear 1–3 minutes after the traffic.
+- Cost: CloudWatch's free tier includes 3 dashboards (up to 50 metrics each) per account;
+  beyond that a dashboard is $3/month. Standard AWS service metrics are free.
