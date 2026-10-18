@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from measure_fulfilment import STACK, session
+from measure_fulfilment import outputs, session
 
 IMAGES = Path(__file__).resolve().parents[1] / "docs" / "images"
 
@@ -44,7 +44,8 @@ def expand(metrics):
 
 def main(minutes=30, images=False, only=None):
     cw = session.client("cloudwatch")
-    body = json.loads(cw.get_dashboard(DashboardName=f"{STACK}-dashboard")["DashboardBody"])
+    name = outputs["DashboardUrl"].rsplit("/", 1)[-1]  # primary/secondary names differ
+    body = json.loads(cw.get_dashboard(DashboardName=name)["DashboardBody"])
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=minutes)
     empty = 0

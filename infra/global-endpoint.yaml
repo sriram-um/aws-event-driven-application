@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Exercise 9 - EventBridge global endpoint for the orders bus (active-active, multi-region DR).
+  Deploy in the primary region after the app stack exists in BOTH regions (same bus name):
+    aws cloudformation deploy --region us-east-1 --template-file infra/global-endpoint.yaml
+      --stack-name orders-event-driven-app-global-endpoint --capabilities CAPABILITY_NAMED_IAM
+  Then redeploy the app stacks with GlobalEndpointId = output EndpointId.
+
+Parameters:
+  AppStackName:
+    Type: String
+    Default: orders-event-driven-app
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+
+Resources:
+  # Health of EventBridge in the primary region, as recommended by AWS: the service-level time
+  # from ingestion to the first target invocation, averaged over 1 minute, above 30 s for
+  # 5 consecutive minutes. Missing data (no events) must count as healthy - otherwise a quiet
+  # application would fail over just because nothing happened.
+  PrimaryRegionLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppStackName}-eventbridge-primary-unhealthy'
+      AlarmDescription: >
+        EventBridge IngestionToInvocationStartLatency in the primary region above 30 s for
+        5 minutes - drives the global endpoint's Route 53 health check (failover)
+      Namespace: AWS/Events
+      MetricName: IngestionToInvocationStartLatency
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 30000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Route 53 health check that mirrors the alarm (ALARM -> unhealthy -> failover)
+  PrimaryRegionHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: CLOUDWATCH_METRIC
+        AlarmIdentifier:
+          Name: !Ref PrimaryRegionLatencyAlarm
+          Region: !Ref AWS::Region
+        InsufficientDataHealthStatus: Healthy
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub '${AppStackName}-eventbridge-primary'
+        - Key: project
+          Value: event-driven-orders
+
+  # Used by EventBridge to create the endpoint's managed replication rules on both buses and by
+  # those rules to forward every event to the other region's bus. Scoped to rules on the two
+  # orders buses (AWS documents no exact policy; a role with PutEvents only fails with "does not
+  # grant EventBridge the PutRule permission for events replication").
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Fixed name: the policy below lets the role pass itself to the managed rules' targets
+      RoleName: !Sub '${AppStackName}-global-endpoint-replication'
+      Description: EventBridge global endpoint event replication between the two orders buses
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: replicate-order-events
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource:
+                  - !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${AppStackName}-bus'
+                  - !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${AppStackName}-bus'
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                  - events:DescribeRule
+                Resource:
+                  - !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${AppStackName}-bus/*'
+                  - !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:rule/${AppStackName}-bus/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AppStackName}-global-endpoint-replication'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: events.amazonaws.com
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  OrdersGlobalEndpoint:
+    Type: AWS::Events::Endpoint
+    Properties:
+      Name: !Sub '${AppStackName}-endpoint'
+      Description: Orders bus - primary us-east-1, fails over to the secondary region
+      RoutingConfig:
+        FailoverConfig:
+          Primary:
+            HealthCheck: !Sub 'arn:aws:route53:::healthcheck/${PrimaryRegionHealthCheck}'
+          Secondary:
+            Route: !Ref SecondaryRegion
+      # Replication keeps both buses receiving every event and is required for automatic
+      # failback (AWS recommends it). The app's processing rules only act on events ingested
+      # in their own region, so the copies aren't processed twice.
+      ReplicationConfig:
+        State: ENABLED
+      RoleArn: !GetAtt ReplicationRole.Arn
+      EventBuses:
+        - EventBusArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${AppStackName}-bus'
+        - EventBusArn: !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${AppStackName}-bus'
+
+Outputs:
+  EndpointId:
+    Description: Pass to both app stacks as GlobalEndpointId
+    Value: !GetAtt OrdersGlobalEndpoint.EndpointId
+  EndpointUrl:
+    Description: Global endpoint URL
+    Value: !GetAtt OrdersGlobalEndpoint.EndpointUrl
+  HealthCheckId:
+    Description: Route 53 health check (invert it to test failover)
+    Value: !Ref PrimaryRegionHealthCheck
+  AlarmName:
+    Description: CloudWatch alarm behind the health check
+    Value: !Ref PrimaryRegionLatencyAlarm

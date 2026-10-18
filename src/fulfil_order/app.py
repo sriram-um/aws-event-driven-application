@@ -27,6 +27,10 @@ tracer = Tracer(patch_modules=["botocore"])
 TABLE_NAME = os.environ["TABLE_NAME"]
 EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
 EVENT_SOURCE = "orders.service"
+# Exercise 9: publish through the EventBridge global endpoint when one is configured. The
+# endpoint routes to the primary region's bus, or the secondary's after a failover; requests
+# are signed with SigV4a, which needs awscrt (CRT layer). Empty = publish to the regional bus.
+EVENT_ENDPOINT_ID = os.environ.get("EVENT_ENDPOINT_ID") or None
 # Simulated fulfilment network: an order is always routed to the same warehouse
 WAREHOUSES = ("IAD-1", "CMH-1", "PDX-1")
 # Claim lifetime: longer than the function timeout (10 s), shorter than the queue's visibility
@@ -78,6 +82,7 @@ def _claim(event_id, order, message_id):
         "orderCreatedAt": order["createdAt"],
         "fulfilledAt": datetime.now(timezone.utc).isoformat(),
         "sourceEventId": event_id,
+        "fulfilledIn": os.environ.get("AWS_REGION", "local"),  # exercise 9: which region processed it
         "processingState": "IN_PROGRESS",
         "claimedBy": message_id,
         "lockExpiresAt": int(time.time()) + LOCK_SECONDS,
@@ -128,9 +133,11 @@ def _complete(order_id, message_id):
 @tracer.capture_method
 def _publish_order_fulfilled(fulfilment):
     detail = {k: fulfilment[k] for k in (
-        "orderId", "customerId", "warehouse", "itemCount", "total", "orderCreatedAt", "fulfilledAt")}
-    resp = events.put_events(Entries=[{
-        "EventBusName": EVENT_BUS_NAME,
+        "orderId", "customerId", "warehouse", "itemCount", "total", "orderCreatedAt", "fulfilledAt",
+        "fulfilledIn")}
+    via_endpoint = {"EndpointId": EVENT_ENDPOINT_ID} if EVENT_ENDPOINT_ID else {}
+    resp = events.put_events(**via_endpoint, Entries=[{
+        "EventBusName": EVENT_BUS_NAME,  # still required with an endpoint (same name in both regions)
         "Source": EVENT_SOURCE,
         "DetailType": "OrderFulfilled",
         # A resumed fulfilment is read back from DynamoDB, where numbers are Decimal

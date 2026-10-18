@@ -5,16 +5,51 @@ Description: >
   EventBridge, SQS, SNS, CloudWatch).
 
 Parameters:
-  PowertoolsLayerArn:
+  PowertoolsLayerVersion:
     Type: String
     Description: >
-      Powertools for AWS Lambda (Python) layer, pinned. Latest is published at SSM
-      /aws/service/powertools/python/arm64/python3.12/latest
-    Default: arn:aws:lambda:us-east-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:39
+      Powertools for AWS Lambda (Python) layer version, pinned. Latest is published at SSM
+      /aws/service/powertools/python/arm64/python3.12/latest. Exercise 9: only the version is a
+      parameter - layers are regional, so the ARN is built for the stack's region.
+    Default: '39'
   AppVersion:
     Type: String
     Description: Deployed version (the CI pipeline passes the git commit SHA)
     Default: local
+  PrimaryRegion:
+    Type: String
+    Description: Exercise 9 - region whose stack owns the global tables (and the global endpoint)
+    Default: us-east-1
+  SecondaryRegion:
+    Type: String
+    Description: Exercise 9 - disaster-recovery region (global table replicas, failover bus)
+    Default: us-west-2
+  GlobalEndpointId:
+    Type: String
+    Description: >
+      Exercise 9 - EventBridge global endpoint id (output EndpointId of the
+      <stack>-global-endpoint stack). Empty = Lambdas publish to the regional bus.
+    Default: ''
+  PrimaryUserPoolKeyArn:
+    Type: String
+    Description: >
+      Exercise 9 - secondary stack only: output UserPoolKeyArn of the primary stack (the
+      multi-Region KMS key this stack replicates for the Cognito user pool replica)
+    Default: not-used-in-the-primary-region
+  PrimaryUserPoolId:
+    Type: String
+    Description: >
+      Exercise 9 - secondary stack only: output UserPoolId of the primary stack. The Cognito
+      replica in this region shares that pool id (and its app client id).
+    Default: not-used-in-the-primary-region
+  PrimaryUserPoolClientId:
+    Type: String
+    Description: Exercise 9 - secondary stack only - output UserPoolClientId of the primary stack
+    Default: not-used-in-the-primary-region
+
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+  IsSecondaryRegion: !Not [!Condition IsPrimaryRegion]
 
 Globals:
   Function:
@@ -26,12 +61,13 @@ Globals:
     # X-Ray active tracing (SAM adds the xray:Put* permissions)
     Tracing: Active
     Layers:
-      - !Ref PowertoolsLayerArn
+      - !Sub 'arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:${PowertoolsLayerVersion}'
     Environment:
       Variables:
         POWERTOOLS_SERVICE_NAME: orders
         POWERTOOLS_LOG_LEVEL: INFO
         APP_VERSION: !Ref AppVersion
+        EVENT_ENDPOINT_ID: !Ref GlobalEndpointId
     Tags:
       project: event-driven-orders
 
@@ -39,11 +75,17 @@ Resources:
   # ---------------------------------------------------------------------------
   # Exercise 0 (baseline): Orders table - one header item (sk = ORDER) plus one
   # item per order line (sk = ITEM#<itemId>) under the same orderId
+  # Exercise 9: now a global table (us-east-1 + us-west-2). CloudFormation can't change a
+  # Table into a GlobalTable, so it's a new resource; items were copied with
+  # scripts/copy_tables.py.
   # ---------------------------------------------------------------------------
-  OrdersTable:
-    Type: AWS::DynamoDB::Table
+  OrdersGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
+    # Created by the primary region's stack only; the secondary stack uses the replica, which
+    # has the same name - so every reference below builds the name/ARN from the stack name.
+    Condition: IsPrimaryRegion
     Properties:
-      TableName: !Sub '${AWS::StackName}-Orders'
+      TableName: !Sub '${AWS::StackName}-orders-global'
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: orderId
@@ -55,13 +97,25 @@ Resources:
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      # Required for global tables (replication runs on DynamoDB Streams)
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
       SSESpecification:
         SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: project
-          Value: event-driven-orders
+        SSEType: KMS          # AWS managed key aws/dynamodb in each region
+      Replicas:
+        - Region: !Ref PrimaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: project
+              Value: event-driven-orders
+        - Region: !Ref SecondaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: project
+              Value: event-driven-orders
 
   # ---------------------------------------------------------------------------
   # Exercise 0 (baseline): CreateOrder Lambda
@@ -72,25 +126,35 @@ Resources:
     Properties:
       FunctionName: !Sub '${AWS::StackName}-CreateOrder'
       Description: Consumes accepted orders from SQS, saves them and publishes OrderCreated
+      Layers:
+        - !Ref CrtLayer   # exercise 9: SigV4a for the global endpoint (added to the Powertools layer)
       CodeUri: src/create_order/
       Handler: app.lambda_handler
       Environment:
         Variables:
-          TABLE_NAME: !Ref OrdersTable
+          TABLE_NAME: !Sub '${AWS::StackName}-orders-global'
           EVENT_BUS_NAME: !Ref OrdersEventBus
       Policies:
         # Least privilege: write actions on this table only (TransactWriteItems is
         # authorised per contained PutItem)
         - DynamoDBWritePolicy:
-            TableName: !Ref OrdersTable
+            TableName: !Sub '${AWS::StackName}-orders-global'
         # Exercise 8: consistent read of the idempotency record after a lost conditional write
         - Statement:
             - Effect: Allow
               Action: dynamodb:GetItem
-              Resource: !GetAtt OrdersTable.Arn
+              Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-orders-global'
         # Exercise 1: events:PutEvents on the orders bus only
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref OrdersEventBus
+        # Exercise 9: through the global endpoint the event lands on the bus of whichever region
+        # the endpoint routes to - same bus name in both regions
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource:
+                - !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/${AWS::StackName}-bus'
+                - !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${AWS::StackName}-bus'
       Events:
         OrderIntakeQueue:
           Type: SQS   # SAM adds the sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes policy
@@ -234,8 +298,8 @@ Resources:
                     #end
                     {
                       "RequestItems": {
-                        "${OrdersTable}": {"Keys": [{"orderId": {"S": "$orderId"}, "sk": {"S": "ORDER"}}]},
-                        "${FulfilmentsTable}": {"Keys": [{"orderId": {"S": "$orderId"}}]}
+                        "${AWS::StackName}-orders-global": {"Keys": [{"orderId": {"S": "$orderId"}, "sk": {"S": "ORDER"}}]},
+                        "${AWS::StackName}-fulfilments-global": {"Keys": [{"orderId": {"S": "$orderId"}}]}
                       }
                     }
                 responses:
@@ -246,8 +310,8 @@ Resources:
                       # the caller (customerId = verified Cognito sub).
                       application/json: !Sub |
                         #set($responses = $input.path('$.Responses'))
-                        #set($orders = $responses.get('${OrdersTable}'))
-                        #set($fulfilments = $responses.get('${FulfilmentsTable}'))
+                        #set($orders = $responses.get('${AWS::StackName}-orders-global'))
+                        #set($fulfilments = $responses.get('${AWS::StackName}-fulfilments-global'))
                         #if(!$orders || $orders.size() == 0 || $orders.get(0).customerId.S != $context.authorizer.claims.sub)
                         #set($context.responseOverride.status = 404)
                         {"message": "order not found (it may still be processing)"}
@@ -269,7 +333,10 @@ Resources:
                           ## escapeJavaScript turns ' into \' (invalid JSON) - undo that
                           "reason": "$util.escapeJavaScript($o.reason.S).replaceAll("\\'", "'")"#end#if($fulfilled),
                           "warehouse": "$fulfilments.get(0).warehouse.S",
-                          "fulfilledAt": "$fulfilments.get(0).fulfilledAt.S"#end
+                          "fulfilledAt": "$fulfilments.get(0).fulfilledAt.S",
+                          "fulfilledIn": "$!fulfilments.get(0).fulfilledIn.S"#end,
+                          "createdIn": "$!o.createdIn.S",
+                          "servedBy": "$context.domainName"
 
                         }
                         #end
@@ -321,7 +388,11 @@ Resources:
         AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
           CognitoAuthorizer:
-            UserPoolArn: !GetAtt UserPool.Arn
+            # Exercise 9: the secondary region validates tokens against the user pool replica
+            UserPoolArn: !If
+              - IsPrimaryRegion
+              - !GetAtt UserPool.Arn
+              - !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${PrimaryUserPoolId}'
       MethodSettings:
         - ResourcePath: '/*'
           HttpMethod: '*'
@@ -395,11 +466,25 @@ Resources:
               - Effect: Allow
                 Action: dynamodb:BatchGetItem
                 Resource:
-                  - !GetAtt OrdersTable.Arn
-                  - !GetAtt FulfilmentsTable.Arn
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-orders-global'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-fulfilments-global'
       Tags:
         - Key: project
           Value: event-driven-orders
+
+  # Exercise 9: awscrt for SigV4a-signed PutEvents to the global endpoint. Built by
+  # scripts/build_crt_layer.sh (Linux arm64 wheel) before `sam build`.
+  CrtLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-awscrt'
+      Description: AWS Common Runtime (awscrt 0.38.0) for SigV4a
+      ContentUri: layers/crt/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      RetentionPolicy: Delete
 
   # ---------------------------------------------------------------------------
   # Exercise 1: custom EventBridge bus - CreateOrder publishes OrderCreated here
@@ -461,10 +546,14 @@ Resources:
   # ---------------------------------------------------------------------------
   # Exercise 2: OrderCreated -> SQS fulfilment queue -> FulfilOrder Lambda -> Fulfilments table
   # ---------------------------------------------------------------------------
-  FulfilmentsTable:
-    Type: AWS::DynamoDB::Table
+  # Exercise 9: global table (see OrdersGlobalTable)
+  FulfilmentsGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
+    # Created by the primary region's stack only; the secondary stack uses the replica, which
+    # has the same name - so every reference below builds the name/ARN from the stack name.
+    Condition: IsPrimaryRegion
     Properties:
-      TableName: !Sub '${AWS::StackName}-Fulfilments'
+      TableName: !Sub '${AWS::StackName}-fulfilments-global'
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: orderId
@@ -472,14 +561,25 @@ Resources:
       KeySchema:
         - AttributeName: orderId
           KeyType: HASH
+      # Required for global tables (replication runs on DynamoDB Streams)
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
       SSESpecification:
         SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: project
-          Value: event-driven-orders
-
+        SSEType: KMS          # AWS managed key aws/dynamodb in each region
+      Replicas:
+        - Region: !Ref PrimaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: project
+              Value: event-driven-orders
+        - Region: !Ref SecondaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: project
+              Value: event-driven-orders
   FulfilmentQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -526,6 +626,11 @@ Resources:
           - orders.service
         detail-type:
           - OrderCreated
+        # Exercise 9: process only events ingested in this region. With global-endpoint
+        # replication every event also reaches the other region's bus (its "region" field
+        # stays the ingesting region), and that copy must not be fulfilled/notified twice.
+        region:
+          - !Ref AWS::Region
       State: ENABLED
       Targets:
         - Id: fulfilment-queue
@@ -542,22 +647,32 @@ Resources:
     Properties:
       FunctionName: !Sub '${AWS::StackName}-FulfilOrder'
       Description: Consumes OrderCreated from SQS, records the fulfilment, publishes OrderFulfilled
+      Layers:
+        - !Ref CrtLayer   # exercise 9: SigV4a for the global endpoint (added to the Powertools layer)
       CodeUri: src/fulfil_order/
       Handler: app.lambda_handler
       Environment:
         Variables:
-          TABLE_NAME: !Ref FulfilmentsTable
+          TABLE_NAME: !Sub '${AWS::StackName}-fulfilments-global'
           EVENT_BUS_NAME: !Ref OrdersEventBus
       Policies:
         - DynamoDBWritePolicy:
-            TableName: !Ref FulfilmentsTable
+            TableName: !Sub '${AWS::StackName}-fulfilments-global'
         # Exercise 8: consistent read of the idempotency record after a lost conditional write
         - Statement:
             - Effect: Allow
               Action: dynamodb:GetItem
-              Resource: !GetAtt FulfilmentsTable.Arn
+              Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-fulfilments-global'
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref OrdersEventBus
+        # Exercise 9: through the global endpoint the event lands on the bus of whichever region
+        # the endpoint routes to - same bus name in both regions
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource:
+                - !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/${AWS::StackName}-bus'
+                - !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${AWS::StackName}-bus'
       Events:
         FulfilmentQueue:
           Type: SQS   # SAM adds the sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes policy
@@ -620,6 +735,11 @@ Resources:
         detail-type:
           - OrderCreated
           - OrderFulfilled
+        # Exercise 9: process only events ingested in this region. With global-endpoint
+        # replication every event also reaches the other region's bus (its "region" field
+        # stays the ingesting region), and that copy must not be fulfilled/notified twice.
+        region:
+          - !Ref AWS::Region
       State: ENABLED
       Targets:
         - Id: order-notifications-topic
@@ -693,7 +813,12 @@ Resources:
   EventsDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
-      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      # Dashboard names are account-wide (not per region): the secondary region's stack adds a
+      # suffix, the primary keeps the original name
+      DashboardName: !If
+        - IsPrimaryRegion
+        - !Sub '${AWS::StackName}-dashboard'
+        - !Sub '${AWS::StackName}-dashboard-${AWS::Region}'
       # Rule names are built from the stack name: !Ref on a rule on a custom bus
       # returns "bus|rule", which isn't a valid RuleName dimension value.
       # EventBridge, SNS and Lambda publish no datapoint for idle minutes, so those metrics
@@ -992,8 +1117,132 @@ Resources:
       OKActions:
         - !Ref OpsAlertsTopic
 
+  # ---------------------------------------------------------------------------
+  # Exercise 9: Cognito multi-Region replication (one user directory, shared pool id and
+  # `sub` in both regions). Prerequisite: a multi-Region customer managed key on the pool,
+  # available in both regions - the primary key here, its replica in the secondary stack.
+  # ---------------------------------------------------------------------------
+  UserPoolKey:
+    Type: AWS::KMS::Key
+    Condition: IsPrimaryRegion
+    Properties:
+      Description: Orders user pool encryption at rest (multi-Region, required for Cognito MRR)
+      MultiRegion: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Scoped to this account's user pools (a Ref to the pool would be circular: the pool
+          # references this key). ViaService covers both regions so the replica key can share it.
+          - Sid: CognitoServiceAccess
+            Effect: Allow
+            Principal:
+              Service:
+                - cognito-idp.amazonaws.com
+                - identitystore.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cognito-idp:*:${AWS::AccountId}:userpool/*'
+          - Sid: AccessThroughCognito
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService:
+                  - !Sub 'cognito-idp.${PrimaryRegion}.amazonaws.com'
+                  - !Sub 'cognito-idp.${SecondaryRegion}.amazonaws.com'
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  # Replica of the primary region's multi-Region key - same key material, so the Cognito
+  # replica in this region can decrypt the replicated user directory
+  UserPoolKeyReplica:
+    Type: AWS::KMS::ReplicaKey
+    Condition: IsSecondaryRegion
+    Properties:
+      Description: Replica of the orders user pool multi-Region key (Cognito MRR)
+      PrimaryKeyArn: !Ref PrimaryUserPoolKeyArn
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Scoped to this account's user pools (a Ref to the pool would be circular: the pool
+          # references this key). ViaService covers both regions so the replica key can share it.
+          - Sid: CognitoServiceAccess
+            Effect: Allow
+            Principal:
+              Service:
+                - cognito-idp.amazonaws.com
+                - identitystore.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cognito-idp:*:${AWS::AccountId}:userpool/*'
+          - Sid: AccessThroughCognito
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService:
+                  - !Sub 'cognito-idp.${PrimaryRegion}.amazonaws.com'
+                  - !Sub 'cognito-idp.${SecondaryRegion}.amazonaws.com'
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
   UserPool:
     Type: AWS::Cognito::UserPool
+    # Exercise 9: one user directory - the secondary region uses the replica (UserPoolReplica)
+    Condition: IsPrimaryRegion
     Properties:
       UserPoolName: !Sub '${AWS::StackName}-users'
       UsernameAttributes:
@@ -1016,9 +1265,30 @@ Resources:
             Priority: 1
       UserPoolTags:
         project: event-driven-orders
+      # Exercise 9: MRR prerequisites - Essentials plan, multi-Region CMK, and the "updated"
+      # issuer AWS recommends for consistent token validation across regions
+      UserPoolTier: ESSENTIALS
+      KeyConfiguration:
+        KeyType: CUSTOMER_MANAGED_KEY
+        KmsKeyArn: !GetAtt UserPoolKey.Arn
+      IssuerConfiguration:
+        Type: UPDATED
+
+  # Secondary copy of the user directory in the DR region (same pool id, users, app clients).
+  # Created INACTIVE; scripts/activate_user_pool_replica.py switches it to ACTIVE (the
+  # resource has no status property). Users can only be created in the primary.
+  UserPoolReplica:
+    Type: AWS::Cognito::UserPoolReplica
+    Condition: IsPrimaryRegion
+    Properties:
+      UserPoolId: !Ref UserPool
+      RegionName: !Ref SecondaryRegion
+      UserPoolTagsAtCreate:
+        project: event-driven-orders
 
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
+    Condition: IsPrimaryRegion   # replicated to the secondary with the same client id
     Properties:
       ClientName: !Sub '${AWS::StackName}-client'
       UserPoolId: !Ref UserPool
@@ -1039,7 +1309,7 @@ Resources:
 Outputs:
   OrdersTableName:
     Description: Name of the Orders DynamoDB table
-    Value: !Ref OrdersTable
+    Value: !Sub '${AWS::StackName}-orders-global'
   ApiUrl:
     Description: Base URL of the prod stage (PUT/GET {ApiUrl}/orders/{orderId})
     Value: !Sub 'https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
@@ -1047,11 +1317,15 @@ Outputs:
     Description: REST API id
     Value: !Ref OrdersApi
   UserPoolId:
-    Description: Cognito User Pool id
-    Value: !Ref UserPool
+    Description: Cognito User Pool id (shared by the primary pool and its replica)
+    Value: !If [IsPrimaryRegion, !Ref UserPool, !Ref PrimaryUserPoolId]
   UserPoolClientId:
-    Description: Cognito app client id (used to obtain tokens)
-    Value: !Ref UserPoolClient
+    Description: Cognito app client id (used to obtain tokens; same id in the replica)
+    Value: !If [IsPrimaryRegion, !Ref UserPoolClient, !Ref PrimaryUserPoolClientId]
+  UserPoolKeyArn:
+    Condition: IsPrimaryRegion
+    Description: Multi-Region KMS key of the user pool (the secondary stack replicates it)
+    Value: !GetAtt UserPoolKey.Arn
   EventBusName:
     Description: EventBridge bus receiving order events
     Value: !Ref OrdersEventBus
@@ -1078,7 +1352,7 @@ Outputs:
     Value: !Ref OpsAlertsTopic
   FulfilmentsTableName:
     Description: Name of the Fulfilments DynamoDB table
-    Value: !Ref FulfilmentsTable
+    Value: !Sub '${AWS::StackName}-fulfilments-global'
   FulfilmentQueueUrl:
     Description: SQS queue feeding FulfilOrder
     Value: !Ref FulfilmentQueue

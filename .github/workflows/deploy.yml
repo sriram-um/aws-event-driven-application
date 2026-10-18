@@ -64,40 +64,45 @@ jobs:
       - name: Validate template
         run: sam validate --lint --config-env ci
 
-      - name: Build (packages the Lambda code)
+      # Exercise 9: awscrt (SigV4a for the EventBridge global endpoint) as a Linux arm64 layer
+      - name: Build CRT layer
+        run: bash scripts/build_crt_layer.sh
+
+      - name: Build (packages the Lambda code - one build, deployed to both regions)
         run: sam build --config-env ci
 
-      - name: Deploy (uploads code to S3 and updates the stack)
+      - name: Look up the global endpoint id
+        run: |
+          echo "ENDPOINT_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME-global-endpoint" --query "Stacks[0].Outputs[?OutputKey=='EndpointId'].OutputValue" --output text)" >> "$GITHUB_ENV"
+
+      # The primary region first: it owns the global tables, the user pool and its replica
+      - name: Deploy primary region (us-east-1)
         run: >
           sam deploy --config-env ci
           --no-confirm-changeset
           --no-fail-on-empty-changeset
           --role-arn ${{ secrets.AWS_CFN_EXECUTION_ROLE_ARN }}
-          --parameter-overrides AppVersion=${{ github.sha }}
+          --parameter-overrides AppVersion=${{ github.sha }} GlobalEndpointId=${{ env.ENDPOINT_ID }}
 
-      - name: Smoke test - unauthenticated request must be rejected
+      - name: Smoke test primary region
+        run: bash scripts/smoke_test.sh us-east-1
+
+      - name: Look up the primary stack's outputs the secondary depends on
         run: |
-          API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
-          ORDER_URL="$API_URL/orders/$(uuidgen | tr 'A-Z' 'a-z')"
-          for method in PUT GET; do
-            # A new API deployment can take ~1 min to go live; until then the stage serves the
-            # previous one (an unknown route answers 403), so retry for up to 2 minutes
-            for attempt in $(seq 12); do
-              code=$(curl -s -o /dev/null -w "%{http_code}" -X $method "$ORDER_URL" \
-                -H 'Content-Type: application/json' -d '{"items":[]}')
-              echo "$method /orders/{orderId} without token -> HTTP $code (attempt $attempt)"
-              [ "$code" = "401" ] && break
-              sleep 10
-            done
-            test "$code" = "401"
+          for key in UserPoolKeyArn UserPoolId UserPoolClientId; do
+            echo "PRIMARY_$key=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text)" >> "$GITHUB_ENV"
           done
 
-      - name: Smoke test - event-driven resources are in the stack outputs
-        run: |
-          for key in EventBusName OrderIntakeQueueUrl FulfilmentQueueUrl OrderNotificationsTopicArn DashboardUrl; do
-            value=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text)
-            echo "$key = $value"
-            test -n "$value" && test "$value" != "None"
-          done
+      - name: Deploy secondary region (us-west-2)
+        run: >
+          sam deploy --config-env ci-dr
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+          --role-arn ${{ secrets.AWS_CFN_EXECUTION_ROLE_ARN }}
+          --parameter-overrides AppVersion=${{ github.sha }} GlobalEndpointId=${{ env.ENDPOINT_ID }}
+          PrimaryUserPoolKeyArn=${{ env.PRIMARY_UserPoolKeyArn }}
+          PrimaryUserPoolId=${{ env.PRIMARY_UserPoolId }}
+          PrimaryUserPoolClientId=${{ env.PRIMARY_UserPoolClientId }}
+
+      - name: Smoke test secondary region
+        run: bash scripts/smoke_test.sh us-west-2

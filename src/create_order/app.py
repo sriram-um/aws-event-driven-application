@@ -34,6 +34,10 @@ tracer = Tracer(patch_modules=["botocore"])
 TABLE_NAME = os.environ["TABLE_NAME"]
 EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
 EVENT_SOURCE = "orders.service"
+# Exercise 9: publish through the EventBridge global endpoint when one is configured. The
+# endpoint routes to the primary region's bus, or the secondary's after a failover; requests
+# are signed with SigV4a, which needs awscrt (CRT layer). Empty = publish to the regional bus.
+EVENT_ENDPOINT_ID = os.environ.get("EVENT_ENDPOINT_ID") or None
 table = boto3.resource("dynamodb").Table(TABLE_NAME)
 # The resource's client takes plain Python values (it serializes them), also in transactions
 dynamodb = table.meta.client
@@ -140,6 +144,7 @@ def _claim(order_id, customer_id, items, total, accepted_at, payload_hash, messa
         "itemCount": len(items),
         "acceptedAt": accepted_at,
         "createdAt": _now(),
+        "createdIn": os.environ.get("AWS_REGION", "local"),  # exercise 9: which region's API/Lambda
         "payloadHash": payload_hash,
         "processingState": "IN_PROGRESS",
         "claimedBy": message_id,
@@ -229,8 +234,9 @@ def _publish_order_created(order_id, customer_id, items, total, created_at):
         "total": str(total),
         "createdAt": created_at,
     }
-    resp = events.put_events(Entries=[{
-        "EventBusName": EVENT_BUS_NAME,
+    via_endpoint = {"EndpointId": EVENT_ENDPOINT_ID} if EVENT_ENDPOINT_ID else {}
+    resp = events.put_events(**via_endpoint, Entries=[{
+        "EventBusName": EVENT_BUS_NAME,  # still required with an endpoint (same name in both regions)
         "Source": EVENT_SOURCE,
         "DetailType": "OrderCreated",
         "Detail": json.dumps(detail),

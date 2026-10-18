@@ -10,7 +10,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 |---|---|
 | **IaC** | AWS SAM (CloudFormation transform) — one template, one stack per region |
 | **Runtime** | Python 3.12 on arm64 (Graviton) |
-| **Regions** | us-east-1 (primary), us-west-2 (secondary, exercise 9) |
+| **Regions** | us-east-1 (primary) + us-west-2 (secondary) — the full stack runs in both (exercise 9) |
 
 ## Progress
 
@@ -25,7 +25,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 6 | Asynchronous API | API Gateway → SQS | ✅ Done |
 | 7 | Dead-letter queues | SQS | ✅ Done |
 | 8 | Idempotency | Lambda, DynamoDB conditional writes | ✅ Done |
-| 9 | Disaster recovery | EventBridge Global Endpoints | ⬜ |
+| 9 | Disaster recovery | EventBridge Global Endpoints, DynamoDB global tables, Cognito multi-Region replication | ✅ Done |
 | 10 | Cost estimate | AWS Pricing Calculator | ⬜ |
 
 ## Architecture (current)
@@ -90,7 +90,8 @@ copies every `orders.service` event to CloudWatch Logs for inspection.
 **Status path:** `GET /orders/{orderId}` is a second direct integration: one DynamoDB
 `BatchGetItem` reads the Orders header and the Fulfilments item, and a response template returns
 `CREATED` / `FULFILLED` / `REJECTED` — or 404 if the order isn't the caller's or isn't processed
-yet.
+yet. Since exercise 9 it also returns `createdIn` / `fulfilledIn` (the regions that did the work)
+and `servedBy` (the API's domain).
 
 **Fulfilment path (asynchronous):** a second rule routes `OrderCreated` to the SQS fulfilment
 queue → FulfilOrder (event source mapping) records the fulfilment (simulated warehouse, chosen by
@@ -101,6 +102,47 @@ The API response doesn't wait for any of this.
 short notification (built by an EventBridge **input transformer**) to the SNS topic. An SQS
 queue subscribed with raw message delivery stands in for real subscribers (email, SMS,
 webhooks, other services) so delivery can be checked from the CLI.
+
+### Multi-region, active-active (exercise 9)
+
+```
+                       ┌──────────── Cognito user pool us-east-1_bx86ahbOz ────────────┐
+                       │  primary (us-east-1)  ══ multi-Region replication ══►  replica (us-west-2)
+                       │  one directory: same users, same `sub`, same app client id, multi-Region KMS key
+                       └───────────────────────────────────────────────────────────────┘
+   client ──► API us-east-1 (PUT/GET)                     client ──► API us-west-2 (PUT/GET)
+                │ SQS → CreateOrder                                    │ SQS → CreateOrder
+                ▼                                                      ▼
+        ┌──────────────────────── DynamoDB global tables (Orders, Fulfilments) ───────────────────┐
+        └─────────────────────────────── replicated both ways ────────────────────────────────────┘
+                │ PutEvents(EndpointId) - SigV4a (awscrt layer)        │
+                └──────────────────────────┬───────────────────────────┘
+                                           ▼
+                    EventBridge global endpoint  bfuowrpror.veo
+                    healthy ─► bus us-east-1      Route 53 health check ◄── alarm: IngestionToInvocation-
+                    unhealthy ─► bus us-west-2                              StartLatency > 30 s for 5 min
+                    + replication: every event also copied to the other region's bus
+                                           │
+        bus us-east-1 ◄──── managed replication rules ────► bus us-west-2
+        rules: region = us-east-1                           rules: region = us-west-2
+        → fulfilment queue, SNS                             → fulfilment queue, SNS
+        (copies ingested in us-west-2 are ignored)          (copies ingested in us-east-1 are ignored)
+```
+
+- **Both regions serve the API** (each has its own API Gateway, queues, Lambdas, bus, SNS topic,
+  dashboard and DLQs) and read/write the same **DynamoDB global tables**, so an order placed in
+  one region can be read — and shows its fulfilment — in the other.
+- **Events go through the global endpoint.** While the primary is healthy every event is
+  ingested by the us-east-1 bus, whichever region published it; on failover the endpoint routes
+  to us-west-2. Replication is on (AWS recommends it; it's also what makes failback automatic),
+  so every event also lands on the other bus.
+- **Process where ingested.** The fulfilment and notification rules match only events whose
+  `region` (the ingesting region, kept on replicated copies) is their own region, so each event
+  is processed exactly once; the copies are kept only for audit (the log-group rule records
+  everything) and failback.
+- **One user directory.** Cognito multi-Region replication keeps a replica of the primary user
+  pool in us-west-2 (same pool id, users, `sub` and app client id), so a user signs in in either
+  region and owns the same orders in both. Users are created in the primary only.
 
 **Idempotency (exercise 8):** the client-generated `orderId` is the idempotency key, and the
 order header doubles as the idempotency record. CreateOrder processes a message like this:
@@ -173,11 +215,12 @@ the rejected order (duplicate `itemId`) and a duplicate `orderId` CreateOrder sk
 
 ## Data model
 
-`orders-event-driven-app-Orders` — one partition per order:
+`orders-event-driven-app-orders-global` — a DynamoDB **global table** (us-east-1 + us-west-2,
+exercise 9; it replaced `orders-event-driven-app-Orders`), one partition per order:
 
 | Item | `orderId` (PK) | `sk` (SK) | Attributes |
 |---|---|---|---|
-| Header | UUID v4 (client-generated since exercise 6) | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED` / `REJECTED`), `total` (N), `itemCount`, `acceptedAt` (API request time), `createdAt` (saved by CreateOrder), `reason` (only when `REJECTED`); idempotency (exercise 8): `payloadHash` (SHA-256 of customer + sorted, normalised items), `processingState` (`IN_PROGRESS` → `COMPLETED`), `claimedBy` + `lockExpiresAt` (only while in progress), `eventId`, `completedAt` |
+| Header | UUID v4 (client-generated since exercise 6) | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED` / `REJECTED`), `total` (N), `itemCount`, `acceptedAt` (API request time), `createdAt` (saved by CreateOrder), `createdIn` (region, exercise 9), `reason` (only when `REJECTED`); idempotency (exercise 8): `payloadHash` (SHA-256 of customer + sorted, normalised items), `processingState` (`IN_PROGRESS` → `COMPLETED`), `claimedBy` + `lockExpiresAt` (only while in progress), `eventId`, `completedAt` |
 | Line | same | `ITEM#<itemId>` | `itemId`, `productName`, `quantity` (N), `unitPrice` (N) |
 
 ### Event: `OrderCreated`
@@ -222,7 +265,7 @@ order with items and prices:
 
 `warehouse` is `""` for `OrderCreated` (the path doesn't exist in that event).
 
-### Table: `orders-event-driven-app-Fulfilments`
+### Table: `orders-event-driven-app-fulfilments-global` (global table since exercise 9)
 
 | Attribute | Notes |
 |---|---|
@@ -233,6 +276,7 @@ order with items and prices:
 | `orderCreatedAt`, `fulfilledAt` | ISO-8601 UTC — the difference is the end-to-end async latency |
 | `sourceEventId` | EventBridge event id that produced the fulfilment (traceability) |
 | `processingState`, `claimedBy`, `lockExpiresAt` | Idempotency claim (exercise 8): `IN_PROGRESS` until `OrderFulfilled` is published, then `COMPLETED` |
+| `fulfilledIn` | Region whose FulfilOrder processed it (exercise 9) |
 
 A `Query` on `orderId` returns the whole order. The header item gives later exercises one place
 for order-level state (status, idempotency/processing state) without changing the table schema.
@@ -249,10 +293,17 @@ scripts/check_notifications.py Sends N orders and reads the SNS notifications fr
 scripts/check_dashboard.py    Checks every dashboard metric has data; renders widgets to docs/images/
 scripts/dlq_demo.py           DLQ demos: poison messages, and a consumer outage + redrive
 scripts/idempotency_test.py   Duplicate/concurrent/conflicting requests and a publish failure, counted end to end
+scripts/dr_test.py            Multi-region checks: normal routing, failover and failback timing
+scripts/build_crt_layer.sh    Builds the awscrt (SigV4a) layer for Linux arm64
+scripts/copy_tables.py        Exports/imports DynamoDB items (used to migrate to global tables)
+scripts/activate_user_pool_replica.py  Activates the Cognito user pool replica in us-west-2
+scripts/smoke_test.sh         Post-deploy smoke test for one region (used by CI)
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
 infra/github-oidc.yaml        One-time CI/CD bootstrap (GitHub deploy role + CloudFormation execution role)
+infra/global-endpoint.yaml    EventBridge global endpoint, Route 53 health check, alarm, replication role
+layers/crt/                   awscrt layer (built by scripts/build_crt_layer.sh, not committed)
 .github/workflows/deploy.yml  GitHub Actions: test → deploy → smoke tests
 ```
 
@@ -267,10 +318,20 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -q
 
 # Build and deploy (settings come from samconfig.toml)
+bash scripts/build_crt_layer.sh       # awscrt layer for SigV4a (exercise 9)
 sam validate --lint
-sam build
-sam deploy
+sam build && sam deploy                                   # us-east-1 (primary) - first
+sam build --config-env dr && sam deploy --config-env dr   # us-west-2 (secondary)
 ```
+
+First-time setup of the second region, in order (each step depends on the previous one):
+1. Deploy the primary stack — it creates the global tables (with the us-west-2 replicas), the user
+   pool, its multi-Region KMS key and the user pool replica.
+2. `python scripts/activate_user_pool_replica.py ACTIVE` (the replica is created `INACTIVE`).
+3. Deploy the secondary stack with `PrimaryUserPoolKeyArn`, `PrimaryUserPoolId`,
+   `PrimaryUserPoolClientId` (primary stack outputs; `samconfig.toml` `dr` env).
+4. Deploy `infra/global-endpoint.yaml` in us-east-1, then redeploy both app stacks with
+   `GlobalEndpointId` = its `EndpointId` output.
 
 ### Calling the API
 
@@ -325,6 +386,10 @@ push to main ──► test job ──────────────► de
 ```
 
 Pull requests run the tests only; `concurrency` prevents two deployments running at once.
+Since exercise 9 the deploy job builds once and deploys **both regions** in order — us-east-1
+(owns the global tables and the user pool) then us-west-2 — looking up the global endpoint id and
+the primary's user pool/KMS outputs instead of hard-coding them, and smoke-tests each region with
+`scripts/smoke_test.sh`.
 
 **AWS access without stored credentials.** The exercise asks for "AWS credentials stored as GitHub
 repository secrets"; instead of access keys, the secrets hold only two **role ARNs**, and GitHub's
@@ -368,6 +433,23 @@ one per account, so the template references its ARN instead of creating it.
   a crash between the DynamoDB write and `PutEvents` loses the event. Exercise 8 revisits it;
   the alternatives are DynamoDB Streams → EventBridge Pipes (transactional outbox) or retrying
   from a processing state on the order header.
+- **Global endpoint + replication + "process where ingested"** — replication is what AWS
+  recommends and what makes failback automatic, but it puts every event on both buses. Processing
+  both copies relies on idempotency records that live in *eventually consistent* global tables,
+  so two regions processing the same event within a second would both "win". Filtering the
+  processing rules on the event's `region` gives exactly-once processing per event, with the
+  region that ingested it doing the work.
+- **DynamoDB global tables for Orders and Fulfilments** — without them an order placed in
+  us-west-2 but fulfilled in us-east-1 would never show `FULFILLED` in us-west-2, and after a
+  failover the primary's data wouldn't be there. The primary stack owns the tables (a global
+  table is one resource with replicas); the secondary stack references the replica by name.
+- **Cognito multi-Region replication instead of a pool per region** — with two independent pools
+  the same person has two `sub`s and can't read their order through the other region's API (the
+  first version did exactly that). MRR needs the Essentials plan, a multi-Region customer managed
+  KMS key and, as AWS recommends, the "updated" token issuer.
+- **Health check = AWS's recommended EventBridge latency alarm, missing data = healthy** — a
+  quiet application must not fail over because nothing happened. No subscriber metrics in the
+  health check (AWS best practice): a failing consumer should not move all publishing.
 - **Hand-written idempotency on the order header (not a separate table)** — the exercise asks to
   "store the order and its processing state"; keeping both in one item means the claim, the
   order and its lines are written in **one transaction**, so there is never an order without a
@@ -734,3 +816,57 @@ the Lambda log messages:
   A duplicate's "existing result" is what `GET /orders/{orderId}` returns (same as the first
   request's); a conflict is visible in the logs (`ORDER_ID_CONFLICT`). A synchronous check would
   need a Lambda or a conditional write in the API path, giving back part of exercise 6's latency.
+
+### Exercise 9 — multi-region DR with EventBridge global endpoints (measured 2026-10-18)
+
+`scripts/dr_test.py` against both stacks:
+
+**Normal operation (primary healthy)** — one order through each region's API:
+
+| Order placed via | Created in | Events ingested by | Fulfilled in | GET via us-east-1 / us-west-2 | Notifications us-east-1 / us-west-2 |
+|---|---|---|---|---|---|
+| us-east-1 API | us-east-1 | us-east-1 bus (copies on the us-west-2 bus) | us-east-1 | 200 `FULFILLED` / 200 `FULFILLED` | 4 / **0** (2 orders × created + fulfilled) |
+| us-west-2 API | us-west-2 | **us-east-1** bus (via the endpoint) | us-east-1 | 200 `FULFILLED` / 200 `FULFILLED` | |
+
+**Failover and failback** (Route 53 health check inverted = primary reported unhealthy; a probe
+order every ~15 s through the us-east-1 API, checking which bus ingested its event):
+
+| | Result |
+|---|---|
+| Inverting the health check → events ingested in us-west-2 | **71 s** |
+| 3 orders through the *us-east-1* API during the failover | created in us-east-1, events ingested and **fulfilled in us-west-2**, readable via both APIs |
+| Duplicate processing | none — copies replicated back to the us-east-1 bus were ignored; notifications 0 (us-east-1) / 6 (us-west-2) |
+| Restoring the health check → events ingested in us-east-1 again | **36 s** |
+
+With a real outage the alarm adds up to 5 minutes (30 s latency for 5 consecutive minutes)
+before the health check turns unhealthy — AWS documents an RTO/RPO of about 360 s (max 420 s).
+
+**Other measurements:** `PUT` round trip to the us-west-2 API from the client ~347 ms (vs ~165 ms
+to us-east-1 — distance); the migration copied 411 order items and 173 fulfilments into the global
+tables, visible in both regions within seconds.
+
+**Problems hit and fixed (in order):**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| us-west-2 first deploy: `AWS::EarlyValidation::ResourceExistenceCheck` | **CloudWatch dashboard names are account-wide**, not regional | Secondary dashboard gets a region suffix |
+| `lambda:GetLayerVersion … us-east-1 … layer:AWSLambdaPowertoolsPython…` from us-west-2 | **Layers are regional**; the ARN parameter was a us-east-1 ARN | Parameter is now the version; ARN built with `${AWS::Region}` |
+| Stack `ROLLBACK_COMPLETE` | Failed first create | `delete-stack`, redeploy (playbook) |
+| Endpoint `CREATE_FAILED`: role "does not grant EventBridge the PutRule permission for events replication" | The replication role needs to manage the endpoint's managed rules, not just `PutEvents` (no policy is documented) | `PutRule/PutTargets/DeleteRule/RemoveTargets/DescribeRule` on rules of the two buses + `iam:PassRole` of itself to EventBridge |
+| Retry: `Resource … orders-event-driven-app-endpoint already exists` | The rollback left the failed endpoint behind | `aws events delete-endpoint`, redeploy |
+| Order readable only through the region where it was placed (404 elsewhere) | Two independent Cognito pools → different `sub` per region | Cognito multi-Region replication (one directory) |
+| A lint failure didn't stop a deploy | `sam validate --lint ... | tail` masked the exit code | Run lint on its own and check its exit code |
+
+- **Cognito MRR rollout** (each step verified): multi-Region KMS key on the existing pool and the
+  updated issuer (`iss` → `https://issuer-cognito-idp.us-east-1.amazonaws.com/<pool>`, API Gateway's
+  Cognito authorizer kept accepting the tokens) → replica key in us-west-2 → replica pool → activate
+  → secondary API authorizer on the replica ARN (`arn:aws:cognito-idp:us-west-2:…:userpool/us-east-1_…`).
+  The pool was updated in place (same id, users kept).
+- **Cost of DR** (on top of a second copy of every serverless resource, which costs nothing idle):
+  Route 53 health check ≈ $0.50/month, health alarm $0.10, 3 more DLQ alarms $0.30, KMS multi-Region
+  key + replica ≈ $2/month, Cognito MRR $0.0045/MAU, global-table replicated writes, and replicated
+  events at the custom-event price ($1/million). The global endpoint itself has no extra charge.
+- **Known limitation:** the same `orderId` PUT to *both* regions within about a second can create
+  two `OrderCreated` events — each region's conditional write succeeds locally before global-table
+  replication. Client retries normally go to the same region; closing this gap fully would need
+  DynamoDB multi-Region strong consistency (three regions or a witness).

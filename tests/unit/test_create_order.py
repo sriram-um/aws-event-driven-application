@@ -272,3 +272,14 @@ def test_payload_hash_ignores_item_order_and_number_format(app):
     b = app._parse_items({"items": [{**ITEMS["items"][1], "unitPrice": "4.000"}, ITEMS["items"][0]]})
     assert app._payload_hash("u", a) == app._payload_hash("u", b)
     assert app._payload_hash("u", a) != app._payload_hash("v", a)
+
+
+def test_publishes_through_global_endpoint_when_configured(app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, "EVENT_ENDPOINT_ID", "abcde.fghij")
+    monkeypatch.setattr(app.events, "put_events", lambda **kw: calls.append(kw) or {
+        "FailedEntryCount": 0, "Entries": [{"EventId": "evt-1"}]})
+    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+
+    assert calls[0]["EndpointId"] == "abcde.fghij"
+    assert calls[0]["Entries"][0]["EventBusName"] == BUS  # still required with an endpoint

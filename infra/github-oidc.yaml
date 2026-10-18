@@ -37,6 +37,14 @@ Parameters:
     Type: String
     Description: SAM-managed artifact bucket (output SourceBucket of stack aws-sam-cli-managed-default)
     Default: aws-sam-cli-managed-default-samclisourcebucket-2xqpmzurmekw
+  SecondaryRegion:
+    Type: String
+    Description: Exercise 9 - DR region where CI also deploys the app stack
+    Default: us-west-2
+  SecondaryArtifactBucketName:
+    Type: String
+    Description: SAM-managed artifact bucket in the secondary region
+    Default: aws-sam-cli-managed-default-samclisourcebucket-yaffmlkxw6y2
 
 Resources:
   # Assumed by GitHub Actions. Can only drive CloudFormation for the app stack and upload
@@ -82,10 +90,15 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*'
                   - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*'
+                  # Exercise 9: the same app stack in the DR region
+                  - !Sub 'arn:aws:cloudformation:${SecondaryRegion}:${AWS::AccountId}:stack/${AppStackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${SecondaryRegion}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*'
               - Sid: SamTransform
                 Effect: Allow
                 Action: cloudformation:CreateChangeSet
-                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+                  - !Sub 'arn:aws:cloudformation:${SecondaryRegion}:aws:transform/Serverless-2016-10-31'
               - Sid: TemplateValidation
                 Effect: Allow
                 Action:
@@ -102,6 +115,8 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:s3:::${ArtifactBucketName}'
                   - !Sub 'arn:aws:s3:::${ArtifactBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${SecondaryArtifactBucketName}'
+                  - !Sub 'arn:aws:s3:::${SecondaryArtifactBucketName}/*'
               - Sid: PassExecutionRoleToCloudFormation
                 Effect: Allow
                 Action: iam:PassRole

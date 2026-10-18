@@ -5,10 +5,12 @@
 
 Also reports the client-side round trip of the PUT (the 202) measured in this process.
 
-Usage (credentials from ~/.orders-event-driven-test-user.env):
-  python scripts/measure_fulfilment.py [count] [interval_seconds]
+Usage (credentials from ~/.orders-event-driven-test-user.env, or
+~/.orders-event-driven-test-user-<region>.env for another region):
+  [ORDERS_REGION=us-west-2] python scripts/measure_fulfilment.py [count] [interval_seconds]
 """
 import json
+import os
 import statistics
 import sys
 import time
@@ -20,12 +22,14 @@ from pathlib import Path
 import boto3
 
 STACK = "orders-event-driven-app"
-REGION = "us-east-1"
+# Exercise 9: the stack runs in two regions; every script targets ORDERS_REGION (default primary)
+REGION = os.environ.get("ORDERS_REGION", "us-east-1")
 ORDER = {"items": [{"itemId": "SKU-1001", "productName": "measure-fulfilment", "quantity": 1, "unitPrice": 1}]}
 
 session = boto3.Session(profile_name="default", region_name=REGION)
 env = dict(line.split("=", 1) for line in
-           (Path.home() / ".orders-event-driven-test-user.env").read_text().split())
+           (Path.home() / (".orders-event-driven-test-user.env" if REGION == "us-east-1"
+                           else f".orders-event-driven-test-user-{REGION}.env")).read_text().split())
 outputs = {o["OutputKey"]: o["OutputValue"] for o in
            session.client("cloudformation").describe_stacks(StackName=STACK)["Stacks"][0]["Outputs"]}
 

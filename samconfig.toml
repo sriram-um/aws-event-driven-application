@@ -17,6 +17,9 @@ parallel = true
 lint = true
 
 [default.deploy.parameters]
+# Exercise 9: publish through the global endpoint (output EndpointId of
+# orders-event-driven-app-global-endpoint); CI looks it up instead
+parameter_overrides = "GlobalEndpointId=bfuowrpror.veo"
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
 confirm_changeset = false
 fail_on_empty_changeset = false
@@ -39,6 +42,52 @@ parallel = true
 lint = true
 
 [ci.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "orders-event-driven-app"
+tags = "project=\"event-driven-orders\""
+
+# ---------------------------------------------------------------------------
+# Exercise 9: the same stack in the disaster-recovery region (us-west-2).
+# "dr" = local (pinned profile), "ci-dr" = GitHub Actions. The primary-region stack owns the
+# global tables, so us-east-1 must be deployed first.
+# ---------------------------------------------------------------------------
+[dr.global.parameters]
+stack_name = "orders-event-driven-app"
+profile = "default"
+region = "us-west-2"
+
+[dr.build.parameters]
+cached = true
+parallel = true
+
+[dr.validate.parameters]
+lint = true
+
+[dr.deploy.parameters]
+# Exercise 9: global endpoint id + the primary stack's outputs this region depends on
+# (CI looks them up instead)
+parameter_overrides = "GlobalEndpointId=bfuowrpror.veo PrimaryUserPoolKeyArn=arn:aws:kms:us-east-1:977534234172:key/mrk-a9673b09538f4911bbb97a93a8676de0 PrimaryUserPoolId=us-east-1_bx86ahbOz PrimaryUserPoolClientId=7bk48bnetf5gj9jdh1omcr0mrc"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "orders-event-driven-app"
+tags = "project=\"event-driven-orders\""
+
+[ci-dr.global.parameters]
+stack_name = "orders-event-driven-app"
+region = "us-west-2"
+
+[ci-dr.build.parameters]
+parallel = true
+
+[ci-dr.validate.parameters]
+lint = true
+
+[ci-dr.deploy.parameters]
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
 confirm_changeset = false
 fail_on_empty_changeset = false
