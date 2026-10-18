@@ -18,7 +18,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 |---|---|---|---|
 | 0 | Baseline orders API | API Gateway, Lambda, DynamoDB, Cognito | ✅ Done |
 | 1 | Publish events | EventBridge | ✅ Done |
-| 2 | Process messages | SQS, Lambda, DynamoDB | ⬜ |
+| 2 | Process messages | SQS, Lambda, DynamoDB | ✅ Done |
 | 3 | Send notifications | SNS | ⬜ |
 | 4 | Monitoring | CloudWatch dashboard | ⬜ |
 | 5 | CI/CD | GitHub Actions (OIDC) | ⬜ |
@@ -45,17 +45,34 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
              └─────────────────────────┘                    │ (after the write succeeds)
                                               ┌─────────────▼──────────────┐      ┌───────────────────────────┐
                                               │ EventBridge custom bus     │rule  │ CloudWatch Logs           │
-                                              │ orders-event-driven-app-bus│─────►│ /aws/events/<stack>       │
-                                              │ source orders.service      │all   │ copy of every order event │
-                                              │ detail-type OrderCreated   │events│ (14-day retention)        │
-                                              └────────────────────────────┘      └───────────────────────────┘
+                                     ┌───────►│ orders-event-driven-app-bus│─────►│ /aws/events/<stack>       │
+                                     │        │ source orders.service      │all   │ copy of every order event │
+                                     │        │ OrderCreated/OrderFulfilled│events│ (14-day retention)        │
+                                     │        └─────────────┬──────────────┘      └───────────────────────────┘
+                                     │                      │ rule: detail-type = OrderCreated
+                                     │        ┌─────────────▼──────────────┐
+                                     │        │ SQS: <stack>-fulfilment    │ SSE-SQS · visibility 60 s
+                                     │        │ queue policy: only the rule│ (6× function timeout)
+                                     │        └─────────────┬──────────────┘
+                                     │                      │ event source mapping: batch 10,
+                                     │                      │ ReportBatchItemFailures
+                                     │        ┌─────────────▼──────────────┐      ┌───────────────────────────┐
+                                     │        │ Lambda: FulfilOrder        │─────►│ DynamoDB: Fulfilments     │
+                                     └────────│ Powertools BatchProcessor  │ Put  │ PK orderId · warehouse,   │
+                              PutEvents       │ python3.12 / arm64 / 256MB │      │ status, fulfilledAt       │
+                              OrderFulfilled  └────────────────────────────┘      └───────────────────────────┘
 ```
 
 **Request path:** API Gateway (Cognito authorizer checks the JWT) → CreateOrder Lambda (validates
 the payload, takes `customerId` from the token's `sub` claim) → one DynamoDB `TransactWriteItems`
 that writes the order header and every line together, or nothing → `PutEvents` of an
 `OrderCreated` event to the custom bus. A rule copies every `orders.service` event to CloudWatch
-Logs for inspection; consumers (SQS, SNS) are added in exercises 2 and 3.
+Logs for inspection.
+
+**Fulfilment path (asynchronous):** a second rule routes `OrderCreated` to the SQS fulfilment
+queue → FulfilOrder (event source mapping) records the fulfilment (simulated warehouse, chosen by
+a hash of `orderId`) in the Fulfilments table → publishes `OrderFulfilled` back to the bus.
+The API response doesn't wait for any of this.
 
 **Observability:** X-Ray active tracing on the API stage and the Lambda; structured JSON logs
 (Powertools `Logger`, correlation id = API Gateway request id, `app_version` key).
@@ -85,6 +102,24 @@ Money values are strings so consumers never lose precision to floats.
 }
 ```
 
+### Event: `OrderFulfilled`
+
+```json
+{"orderId": "…", "customerId": "…", "warehouse": "PDX-1", "itemCount": 2, "total": "99.48",
+ "orderCreatedAt": "2026-10-18T14:20:19.072+00:00", "fulfilledAt": "2026-10-18T14:20:20.419+00:00"}
+```
+
+### Table: `orders-event-driven-app-Fulfilments`
+
+| Attribute | Notes |
+|---|---|
+| `orderId` (PK) | Same id as the order |
+| `status` | `FULFILLED` |
+| `warehouse` | `IAD-1` / `CMH-1` / `PDX-1` (simulated; stable per order) |
+| `customerId`, `itemCount`, `total` | Copied from the event (`total` kept as a string) |
+| `orderCreatedAt`, `fulfilledAt` | ISO-8601 UTC — the difference is the end-to-end async latency |
+| `sourceEventId` | EventBridge event id that produced the fulfilment (traceability) |
+
 A `Query` on `orderId` returns the whole order. The header item gives later exercises one place
 for order-level state (status, idempotency/processing state) without changing the table schema.
 
@@ -93,7 +128,9 @@ for order-level state (status, idempotency/processing state) without changing th
 ```
 template.yaml                 SAM template (all application infrastructure)
 samconfig.toml                Deploy config: "default" env (local, pinned profile) and "ci" env
-src/create_order/app.py       CreateOrder Lambda handler
+src/create_order/app.py       CreateOrder Lambda handler (API → DynamoDB → EventBridge)
+src/fulfil_order/app.py       FulfilOrder Lambda handler (SQS → DynamoDB → EventBridge)
+scripts/measure_fulfilment.py Sends N orders and breaks down the async fulfilment latency
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
@@ -163,6 +200,19 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
   a crash between the DynamoDB write and `PutEvents` loses the event. Exercise 8 revisits it;
   the alternatives are DynamoDB Streams → EventBridge Pipes (transactional outbox) or retrying
   from a processing state on the order header.
+- **EventBridge → SQS → Lambda instead of EventBridge → Lambda directly** — the queue buffers
+  bursts, controls consumer concurrency, keeps messages for 4 days if the consumer is broken, and
+  gives a place for a dead-letter queue (exercise 7).
+- **Partial batch responses (`ReportBatchItemFailures` + Powertools `BatchProcessor`)** — one bad
+  message in a batch of 10 doesn't make the 9 good ones be processed again. If *every* record
+  fails, Powertools raises `BatchProcessingError` so the invocation shows up as a Lambda error.
+- **FulfilOrder fails the record if `OrderFulfilled` can't be published** — the opposite choice to
+  CreateOrder: here a retry is safe (the message goes back to the queue and the put is
+  overwritten), so redelivery is preferred over a silently lost event.
+- **Queue policy scoped with `aws:SourceArn` = the rule ARN** — only this rule can send to the
+  queue (confused-deputy protection). Queue encrypted with SSE-SQS (no KMS key cost).
+- **`MaximumBatchingWindowInSeconds: 0`** — measured: a 1 s window delayed fulfilment by up to
+  20 s at low traffic (see below).
 - **Log-group rule as a debug/audit trail** — makes every event visible (and queryable with Logs
   Insights) before any consumer exists. Log targets must be under `/aws/events/` and need a
   CloudWatch Logs **resource policy** allowing `events.amazonaws.com`.
@@ -204,3 +254,35 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
 - Rule metrics (`AWS/Events` `MatchedEvents`, `Invocations`, dims `EventBusName` + `RuleName`)
   arrive with a few minutes' delay — the first query showed 5 matched vs 6 invocations;
   a few minutes later both were 6.
+
+### Exercise 2 — SQS + FulfilOrder (measured 2026-10-18, us-east-1)
+
+Measured with `scripts/measure_fulfilment.py` (orders through the real API; timestamps from the
+order header, SQS `SentTimestamp` / `ApproximateFirstReceiveTimestamp`, and `fulfilledAt`):
+
+| Stage (ms, min / median / max) | Batching window 1 s | Batching window 0 (final) | Burst, window 0 |
+|---|---|---|---|
+| Order saved → message in SQS (EventBridge delivery) | 75 / 88 / 300 | 76 / 87 / 299 | 75 / 87 / 224 |
+| Waiting in SQS before first receive | 1 / 1 / 2 | 1 / 1 / 34 | 1 / 1 / 2 |
+| Received → fulfilment written | **1,385 / 9,345 / 20,450** | 39 / 57 / 76 | 34 / 38 / 109 |
+| **Total (order saved → fulfilled)** | **1,498 / 9,546 / 20,526** | **121 / 147 / 409** | **114 / 130 / 272** |
+
+10 orders 2 s apart; burst = 20 orders back to back.
+
+- **The batching window was the whole delay.** With `MaximumBatchingWindowInSeconds: 1`, SQS
+  handed each message to the Lambda poller within 1–2 ms, but the function was invoked up to
+  20 s later — the poller kept collecting for a batch instead of invoking. The ~20 s ceiling
+  matches the SQS long-poll wait, so at low traffic the "1 s" window behaved more like "up to
+  20 s". With the window at 0, fulfilment finishes in ~150 ms. Use a batching window only when
+  throughput/cost per invocation matters more than latency.
+- With the window at 0 every invocation carried **1 record**, even in the burst — the API
+  produces orders ~170 ms apart, slower than the pollers drain them. (With the 1 s window,
+  batches were 1–4 records.)
+- FulfilOrder: cold start Init 639–780 ms; warm Duration 24–41 ms per record (DynamoDB put +
+  `PutEvents`).
+- 50 orders processed across the runs, **0 failures**, queue drained to 0 every time, and every
+  `OrderCreated` has a matching `OrderFulfilled` in the event log group.
+- **Delivery is at-least-once**: today a duplicate message would rewrite the same fulfilment
+  (harmless) but publish a second `OrderFulfilled`. Exercise 8 makes FulfilOrder idempotent.
+- A consumer failing *all* records makes Powertools raise (whole batch retried) — caught by a
+  unit test that initially expected a partial-failure response.

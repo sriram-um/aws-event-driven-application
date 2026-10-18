@@ -177,6 +177,108 @@ Resources:
         - Id: order-events-log-group
           Arn: !GetAtt OrderEventsLogGroup.Arn
 
+  # ---------------------------------------------------------------------------
+  # Exercise 2: OrderCreated -> SQS fulfilment queue -> FulfilOrder Lambda -> Fulfilments table
+  # ---------------------------------------------------------------------------
+  FulfilmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Fulfilments'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  FulfilmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-fulfilment'
+      SqsManagedSseEnabled: true
+      # AWS guidance: at least 6x the consumer function timeout (10 s), so a message
+      # isn't redelivered while a batch (incl. retries/throttling) is still in flight
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600   # 4 days
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  FulfilmentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FulfilmentQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Only this rule may send to the queue (confused-deputy protection)
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FulfilmentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedToFulfilmentRule.Arn
+
+  OrderCreatedToFulfilmentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-order-created-to-fulfilment'
+      Description: Routes OrderCreated events to the fulfilment queue
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source:
+          - orders.service
+        detail-type:
+          - OrderCreated
+      State: ENABLED
+      Targets:
+        - Id: fulfilment-queue
+          Arn: !GetAtt FulfilmentQueue.Arn
+
+  FulfilOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-FulfilOrder'
+      Description: Consumes OrderCreated from SQS, records the fulfilment, publishes OrderFulfilled
+      CodeUri: src/fulfil_order/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FulfilmentsTable
+          EVENT_BUS_NAME: !Ref OrdersEventBus
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref FulfilmentsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref OrdersEventBus
+      Events:
+        FulfilmentQueue:
+          Type: SQS   # SAM adds the sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes policy
+          Properties:
+            Queue: !GetAtt FulfilmentQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 0
+            # Only failed messages are retried, not the whole batch (Powertools BatchProcessor)
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  FulfilOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FulfilOrderFunction}'
+      RetentionInDays: 14
+
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -246,6 +348,15 @@ Outputs:
   OrderEventsLogGroupName:
     Description: CloudWatch log group with a copy of every order event
     Value: !Ref OrderEventsLogGroup
+  FulfilmentsTableName:
+    Description: Name of the Fulfilments DynamoDB table
+    Value: !Ref FulfilmentsTable
+  FulfilmentQueueUrl:
+    Description: SQS queue feeding FulfilOrder
+    Value: !Ref FulfilmentQueue
+  FulfilOrderFunctionName:
+    Description: Name of the FulfilOrder Lambda function
+    Value: !Ref FulfilOrderFunction
   CreateOrderFunctionName:
     Description: Name of the CreateOrder Lambda function
     Value: !Ref CreateOrderFunction
