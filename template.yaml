@@ -64,13 +64,14 @@ Resources:
           Value: event-driven-orders
 
   # ---------------------------------------------------------------------------
-  # Exercise 0 (baseline): CreateOrder Lambda behind POST /orders
+  # Exercise 0 (baseline): CreateOrder Lambda
+  # Exercise 6: no longer behind the API - consumes the intake queue that API Gateway writes to
   # ---------------------------------------------------------------------------
   CreateOrderFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub '${AWS::StackName}-CreateOrder'
-      Description: Validates orders, saves them to the Orders table and publishes OrderCreated
+      Description: Consumes accepted orders from SQS, saves them and publishes OrderCreated
       CodeUri: src/create_order/
       Handler: app.lambda_handler
       Environment:
@@ -86,12 +87,14 @@ Resources:
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref OrdersEventBus
       Events:
-        CreateOrder:
-          Type: Api
+        OrderIntakeQueue:
+          Type: SQS   # SAM adds the sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes policy
           Properties:
-            RestApiId: !Ref OrdersApi
-            Path: /orders
-            Method: POST
+            Queue: !GetAtt OrderIntakeQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 0   # exercise 2: a window adds up to ~20 s latency
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
   CreateOrderLogGroup:
     Type: AWS::Logs::LogGroup
@@ -107,6 +110,203 @@ Resources:
       StageName: prod
       # Setting OpenApiVersion stops SAM from also creating an extra default "Stage" stage
       OpenApiVersion: '3.0.1'
+      # Exercise 6: asynchronous API. Both routes are direct AWS service integrations (no Lambda
+      # in the request path), which need an OpenAPI body. SAM applies the default Cognito
+      # authorizer to every path in it.
+      DefinitionBody:
+        openapi: '3.0.1'
+        info:
+          title: !Sub '${AWS::StackName}-api'
+          version: '2.0'
+        x-amazon-apigateway-request-validators:
+          body-and-params:
+            validateRequestBody: true
+            validateRequestParameters: true
+        x-amazon-apigateway-gateway-responses:
+          # Return the schema violation instead of the generic "Invalid request body"
+          BAD_REQUEST_BODY:
+            statusCode: 400
+            responseTemplates:
+              application/json: '{"message": "$context.error.validationErrorString"}'
+        paths:
+          /orders/{orderId}:
+            put:
+              summary: >
+                Accept an order asynchronously - validated by API Gateway, sent to the intake
+                queue, 202 returned without waiting for CreateOrder. orderId (client-generated
+                UUID) is the idempotency key.
+              x-amazon-apigateway-request-validator: body-and-params
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/OrderRequest'
+              responses:
+                '202':
+                  description: Order accepted for processing
+                '400':
+                  description: Invalid body or orderId
+                '500':
+                  description: Could not enqueue the order
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${OrderIntakeQueue.QueueName}'
+                credentials: !GetAtt ApiSqsSendRole.Arn
+                # Only application/json bodies (the validated model) reach SQS; others get 415
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                  integration.request.header.Accept: "'application/json'"
+                requestTemplates:
+                  # Body = the validated items payload; orderId, customerId (verified Cognito
+                  # sub - never from the body), request time and request id travel as message
+                  # attributes. API Gateway doesn't validate path parameter formats, so the UUID
+                  # check is done here: an invalid id sends a deliberately invalid SQS action,
+                  # which SQS rejects with 400 and the integration response turns into a 400.
+                  application/json: |
+                    #set($orderId = $input.params('orderId'))
+                    #if($orderId.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
+                    Action=SendMessage&MessageBody=$util.urlEncode($input.body)&MessageAttribute.1.Name=orderId&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=$orderId&MessageAttribute.2.Name=customerId&MessageAttribute.2.Value.DataType=String&MessageAttribute.2.Value.StringValue=$util.urlEncode($context.authorizer.claims.sub)&MessageAttribute.3.Name=acceptedAt&MessageAttribute.3.Value.DataType=Number&MessageAttribute.3.Value.StringValue=$context.requestTimeEpoch&MessageAttribute.4.Name=requestId&MessageAttribute.4.Value.DataType=String&MessageAttribute.4.Value.StringValue=$context.requestId
+                    #else
+                    Action=RejectInvalidOrderId
+                    #end
+                responses:
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: |
+                        {
+                          "orderId": "$input.params('orderId')",
+                          "status": "ACCEPTED",
+                          "statusUrl": "/orders/$input.params('orderId')",
+                          "messageId": "$input.path('$.SendMessageResponse.SendMessageResult.MessageId')"
+                        }
+                  '400':
+                    statusCode: '400'
+                    responseTemplates:
+                      application/json: '{"message": "orderId must be a lowercase UUID, e.g. /orders/3f0c6a8e-1b2d-4c5e-8f9a-0b1c2d3e4f5a"}'
+                  '40[1-9]|4[1-9]\d|5\d{2}':
+                    statusCode: '500'
+                    responseTemplates:
+                      application/json: '{"message": "could not accept the order, please retry"}'
+            get:
+              summary: >
+                Order status for the caller's own order - one DynamoDB BatchGetItem across the
+                Orders header and the Fulfilments table (no Lambda)
+              x-amazon-apigateway-request-validator: body-and-params
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              responses:
+                '200':
+                  description: Order status
+                '404':
+                  description: Unknown order, not the caller's, or not processed yet
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:dynamodb:action/BatchGetItem'
+                credentials: !GetAtt ApiOrdersReadRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  # A non-UUID id is replaced by "-" so it simply isn't found (and can't break
+                  # out of the JSON string)
+                  application/json: !Sub |
+                    #set($orderId = $input.params('orderId'))
+                    #if(!$orderId.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
+                    #set($orderId = '-')
+                    #end
+                    {
+                      "RequestItems": {
+                        "${OrdersTable}": {"Keys": [{"orderId": {"S": "$orderId"}, "sk": {"S": "ORDER"}}]},
+                        "${FulfilmentsTable}": {"Keys": [{"orderId": {"S": "$orderId"}}]}
+                      }
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      # DynamoDB JSON -> plain JSON. 404 unless the order exists AND belongs to
+                      # the caller (customerId = verified Cognito sub).
+                      application/json: !Sub |
+                        #set($responses = $input.path('$.Responses'))
+                        #set($orders = $responses.get('${OrdersTable}'))
+                        #set($fulfilments = $responses.get('${FulfilmentsTable}'))
+                        #if(!$orders || $orders.size() == 0 || $orders.get(0).customerId.S != $context.authorizer.claims.sub)
+                        #set($context.responseOverride.status = 404)
+                        {"message": "order not found (it may still be processing)"}
+                        #else
+                        #set($o = $orders.get(0))
+                        #set($fulfilled = $fulfilments && $fulfilments.size() > 0)
+                        #if($fulfilled && $o.status.S == 'CREATED')
+                        #set($status = 'FULFILLED')
+                        #else
+                        #set($status = $o.status.S)
+                        #end
+                        {
+                          "orderId": "$o.orderId.S",
+                          "status": "$status",
+                          "acceptedAt": "$!o.acceptedAt.S",
+                          "createdAt": "$!o.createdAt.S"#if("$!o.total.N" != ""),
+                          "total": "$o.total.N",
+                          "itemCount": $o.itemCount.N#end#if("$!o.reason.S" != ""),
+                          ## escapeJavaScript turns ' into \' (invalid JSON) - undo that
+                          "reason": "$util.escapeJavaScript($o.reason.S).replaceAll("\\'", "'")"#end#if($fulfilled),
+                          "warehouse": "$fulfilments.get(0).warehouse.S",
+                          "fulfilledAt": "$fulfilments.get(0).fulfilledAt.S"#end
+
+                        }
+                        #end
+                  '4\d{2}|5\d{2}':
+                    statusCode: '500'
+                    responseTemplates:
+                      application/json: '{"message": "internal error"}'
+        components:
+          schemas:
+            # JSON Schema (draft 4) enforced by API Gateway before anything is queued. Checks a
+            # schema can't express (duplicate itemIds) are done by CreateOrder -> REJECTED.
+            OrderRequest:
+              type: object
+              required:
+                - items
+              additionalProperties: false
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 25
+                  items:
+                    type: object
+                    required:
+                      - itemId
+                      - quantity
+                      - unitPrice
+                    additionalProperties: false
+                    properties:
+                      itemId:
+                        type: string
+                        minLength: 1
+                        maxLength: 64
+                      productName:
+                        type: string
+                        maxLength: 200
+                      quantity:
+                        type: integer
+                        minimum: 1
+                      unitPrice:
+                        type: number
+                        minimum: 0
       EndpointConfiguration:
         Type: REGIONAL
       TracingEnabled: true
@@ -125,6 +325,72 @@ Resources:
           MetricsEnabled: true
       Tags:
         project: event-driven-orders
+
+  # ---------------------------------------------------------------------------
+  # Exercise 6: intake queue between API Gateway and CreateOrder + integration roles
+  # ---------------------------------------------------------------------------
+  OrderIntakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-order-intake'
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 60            # 6x the CreateOrder timeout (10 s)
+      MessageRetentionPeriod: 345600   # 4 days
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  # Assumed by API Gateway for PUT /orders/{orderId}: send to the intake queue, nothing else
+  ApiSqsSendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets API Gateway send accepted orders to the intake queue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+            # No aws:SourceAccount/SourceArn condition: API Gateway does not send them when it
+            # assumes integration credentials (Project 3 lesson - every call would fail).
+      Policies:
+        - PolicyName: send-to-intake-queue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrderIntakeQueue.Arn
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  # Assumed by API Gateway for GET /orders/{orderId}: read-only, the two tables only
+  ApiOrdersReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets API Gateway read order status (BatchGetItem on Orders + Fulfilments)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-order-status
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:BatchGetItem
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt FulfilmentsTable.Arn
+      Tags:
+        - Key: project
+          Value: event-driven-orders
 
   # ---------------------------------------------------------------------------
   # Exercise 1: custom EventBridge bus - CreateOrder publishes OrderCreated here
@@ -403,7 +669,7 @@ Resources:
             "widgets": [
               {
                 "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
-                "properties": { "markdown": "## Event-driven Orders - ${AWS::StackName}\nAPI **POST /orders** → CreateOrder → bus **${OrdersEventBus}** → rules → SQS **${FulfilmentQueueName}** → FulfilOrder · SNS **${TopicName}**" }
+                "properties": { "markdown": "## Event-driven Orders - ${AWS::StackName}\nAPI **PUT /orders/{orderId}** → SQS **${IntakeQueueName}** → CreateOrder → bus **${OrdersEventBus}** → rules → SQS **${FulfilmentQueueName}** → FulfilOrder · SNS **${TopicName}**" }
               },
               {
                 "type": "metric", "x": 0, "y": 2, "width": 8, "height": 6,
@@ -426,7 +692,8 @@ Resources:
                   "title": "SQS - NumberOfMessagesSent",
                   "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
                   "metrics": [
-                    [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "${FulfilmentQueueName}", { "label": "fulfilment queue" } ],
+                    [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "${IntakeQueueName}", { "label": "intake queue (from API)" } ],
+                    [ "...", "${FulfilmentQueueName}", { "label": "fulfilment queue" } ],
                     [ "...", "${TestQueueName}", { "label": "notifications test subscriber" } ]
                   ]
                 }
@@ -464,11 +731,13 @@ Resources:
               {
                 "type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
                 "properties": {
-                  "title": "SQS - backlog (fulfilment queue)",
+                  "title": "SQS - backlog",
                   "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
                   "metrics": [
-                    [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueueName}", { "stat": "Maximum", "label": "messages waiting" } ],
-                    [ ".", "ApproximateAgeOfOldestMessage", ".", ".", { "stat": "Maximum", "label": "age of oldest (s)", "yAxis": "right" } ]
+                    [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${IntakeQueueName}", { "stat": "Maximum", "label": "intake waiting" } ],
+                    [ "...", "${FulfilmentQueueName}", { "stat": "Maximum", "label": "fulfilment waiting" } ],
+                    [ "AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${IntakeQueueName}", { "stat": "Maximum", "label": "intake oldest (s)", "yAxis": "right" } ],
+                    [ "...", "${FulfilmentQueueName}", { "stat": "Maximum", "label": "fulfilment oldest (s)", "yAxis": "right" } ]
                   ]
                 }
               },
@@ -519,6 +788,7 @@ Resources:
           FulfilmentRule: !Sub '${AWS::StackName}-order-created-to-fulfilment'
           NotificationsRule: !Sub '${AWS::StackName}-order-notifications'
           LogsRule: !Sub '${AWS::StackName}-all-order-events-to-logs'
+          IntakeQueueName: !GetAtt OrderIntakeQueue.QueueName
           FulfilmentQueueName: !GetAtt FulfilmentQueue.QueueName
           TestQueueName: !GetAtt NotificationsTestQueue.QueueName
           TopicName: !GetAtt OrderNotificationsTopic.TopicName
@@ -572,7 +842,7 @@ Outputs:
     Description: Name of the Orders DynamoDB table
     Value: !Ref OrdersTable
   ApiUrl:
-    Description: Base URL of the prod stage (POST {ApiUrl}/orders)
+    Description: Base URL of the prod stage (PUT/GET {ApiUrl}/orders/{orderId})
     Value: !Sub 'https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
   ApiId:
     Description: REST API id
@@ -592,6 +862,9 @@ Outputs:
   OrderEventsLogGroupName:
     Description: CloudWatch log group with a copy of every order event
     Value: !Ref OrderEventsLogGroup
+  OrderIntakeQueueUrl:
+    Description: SQS queue between API Gateway and CreateOrder
+    Value: !Ref OrderIntakeQueue
   FulfilmentsTableName:
     Description: Name of the Fulfilments DynamoDB table
     Value: !Ref FulfilmentsTable

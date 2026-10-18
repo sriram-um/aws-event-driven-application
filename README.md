@@ -22,7 +22,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 3 | Send notifications | SNS | ✅ Done |
 | 4 | Monitoring | CloudWatch dashboard | ✅ Done |
 | 5 | CI/CD | GitHub Actions (OIDC) | ✅ Done |
-| 6 | Asynchronous API | API Gateway → SQS | ⬜ |
+| 6 | Asynchronous API | API Gateway → SQS | ✅ Done |
 | 7 | Dead-letter queues | SQS | ⬜ |
 | 8 | Idempotency | Lambda, DynamoDB conditional writes | ⬜ |
 | 9 | Disaster recovery | EventBridge Global Endpoints | ⬜ |
@@ -36,14 +36,21 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
         ┌───────►│ admin-created users  │
         │        └──────────┬───────────┘
         │                   │ validates JWT
- client ┴──► ┌──────────────▼──────────┐      ┌────────────────────────────┐      ┌───────────────────────────┐
- HTTPS       │ API Gateway (REST)      │─────►│ Lambda: CreateOrder        │─────►│ DynamoDB: Orders          │
- Authorization│ stage prod · REGIONAL  │proxy │ python3.12 / arm64 / 256MB │trans-│ PK orderId · SK sk        │
- : <IdToken> │ POST /orders            │      │ validates, Powertools logs │action│ ORDER header + ITEM# lines│
-             │ Cognito authorizer      │      └─────────────┬──────────────┘      │ on-demand · SSE · PITR    │
-             │ throttle 100 rps/50 burst│                    │ PutEvents          └───────────────────────────┘
-             └─────────────────────────┘                    │ (after the write succeeds)
-                                              ┌─────────────▼──────────────┐      ┌───────────────────────────┐
+ client ┴──► ┌──────────────▼───────────┐ SendMessage ┌──────────────────────────┐
+ HTTPS       │ API Gateway (REST)       │────────────►│ SQS: <stack>-order-intake│  202 returned as soon as
+ Authorization│ stage prod · REGIONAL   │ direct AWS  │ body = items, attributes │  the message is queued
+ : <IdToken> │ PUT /orders/{orderId}    │ integration │ orderId, customerId,     │
+             │  JSON-schema validation  │ (VTL, role) │ acceptedAt, requestId    │
+             │ GET /orders/{orderId}    │             └────────────┬─────────────┘
+             │  BatchGetItem (no Lambda)│                          │ event source mapping, batch 10
+             │ Cognito authorizer       │             ┌────────────▼───────────────┐      ┌───────────────────────────┐
+             │ throttle 100 rps/50 burst│             │ Lambda: CreateOrder        │─────►│ DynamoDB: Orders          │
+             └────────────┬─────────────┘             │ python3.12 / arm64 / 256MB │trans-│ PK orderId · SK sk        │
+                          │ GET reads Orders header   │ BatchProcessor, REJECTED   │action│ ORDER header + ITEM# lines│
+                          │ + Fulfilments directly    │ for invalid orders         │      │ on-demand · SSE · PITR    │
+                          └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┴─────────────┬──────────────┴ ─ ─ ►└───────────────────────────┘
+                                                                    │ PutEvents (after the write succeeds)
+                                              ┌─────────────────────▼──────┐      ┌───────────────────────────┐
                                               │ EventBridge custom bus     │rule  │ CloudWatch Logs           │
                                      ┌───────►│ orders-event-driven-app-bus│─────►│ /aws/events/<stack>       │
                                      │        │ source orders.service      │all   │ copy of every order event │
@@ -70,11 +77,20 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
                               OrderFulfilled  └────────────────────────────┘      └───────────────────────────┘
 ```
 
-**Request path:** API Gateway (Cognito authorizer checks the JWT) → CreateOrder Lambda (validates
-the payload, takes `customerId` from the token's `sub` claim) → one DynamoDB `TransactWriteItems`
-that writes the order header and every line together, or nothing → `PutEvents` of an
-`OrderCreated` event to the custom bus. A rule copies every `orders.service` event to CloudWatch
-Logs for inspection.
+**Request path (asynchronous, exercise 6):** `PUT /orders/{orderId}` with a client-generated UUID.
+API Gateway checks the JWT (Cognito authorizer), validates the body against a JSON-schema model,
+checks the `orderId` format in the mapping template, and sends the body straight to the SQS
+**intake queue** — `orderId`, `customerId` (the token's `sub` claim, never the body), the request
+time and request id travel as message attributes — then returns **202 Accepted** without waiting
+for any Lambda. CreateOrder consumes the queue in batches: re-checks the payload (rules a schema
+can't express, e.g. duplicate `itemId`s → stored as `REJECTED`), writes the header and every line
+in one `TransactWriteItems` (or nothing), then publishes `OrderCreated` to the custom bus. A rule
+copies every `orders.service` event to CloudWatch Logs for inspection.
+
+**Status path:** `GET /orders/{orderId}` is a second direct integration: one DynamoDB
+`BatchGetItem` reads the Orders header and the Fulfilments item, and a response template returns
+`CREATED` / `FULFILLED` / `REJECTED` — or 404 if the order isn't the caller's or isn't processed
+yet.
 
 **Fulfilment path (asynchronous):** a second rule routes `OrderCreated` to the SQS fulfilment
 queue → FulfilOrder (event source mapping) records the fulfilment (simulated warehouse, chosen by
@@ -94,10 +110,10 @@ every event in `/aws/events/<stack>`; and the CloudWatch dashboard
 | Widget | Metrics |
 |---|---|
 | EventBridge — MatchedEvents per rule | `AWS/Events MatchedEvents` (dims `EventBusName` + `RuleName`) for the 3 rules |
-| SQS — NumberOfMessagesSent | `AWS/SQS NumberOfMessagesSent` for the fulfilment queue and the test subscriber |
+| SQS — NumberOfMessagesSent | `AWS/SQS NumberOfMessagesSent` for the intake queue, the fulfilment queue and the test subscriber |
 | SNS — NumberOfMessagesPublished | `AWS/SNS NumberOfMessagesPublished`, `NumberOfNotificationsDelivered`, `NumberOfNotificationsFailed` |
 | EventBridge — FailedInvocations per rule | Target delivery failures (permissions, throttling) |
-| SQS — backlog | `ApproximateNumberOfMessagesVisible`, `ApproximateAgeOfOldestMessage` (fulfilment queue) |
+| SQS — backlog | `ApproximateNumberOfMessagesVisible`, `ApproximateAgeOfOldestMessage` (intake + fulfilment queues) |
 | Lambda — Invocations & Errors | CreateOrder and FulfilOrder |
 | API Gateway — requests & errors | `Count`, `4XXError`, `5XXError` (stage `prod`) |
 | Duration p90 | API Gateway `Latency`, Lambda `Duration` for both functions |
@@ -115,7 +131,7 @@ Images rendered from the deployed dashboard with `scripts/check_dashboard.py --i
 
 | Item | `orderId` (PK) | `sk` (SK) | Attributes |
 |---|---|---|---|
-| Header | UUID v4 | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED`), `total` (N), `itemCount`, `createdAt` (ISO-8601 UTC) |
+| Header | UUID v4 (client-generated since exercise 6) | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED` / `REJECTED`), `total` (N), `itemCount`, `acceptedAt` (API request time), `createdAt` (saved by CreateOrder), `reason` (only when `REJECTED`) |
 | Line | same | `ITEM#<itemId>` | `itemId`, `productName`, `quantity` (N), `unitPrice` (N) |
 
 ### Event: `OrderCreated`
@@ -223,16 +239,27 @@ TOKEN=$(aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH --client-id
   --auth-parameters USERNAME=you@example.com,PASSWORD='<strong-password>' \
   --query AuthenticationResult.IdToken --output text)
 
-curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: application/json' \
+# Place an order: the client generates the orderId (the idempotency key)
+ORDER_ID=$(python -c "import uuid; print(uuid.uuid4())")
+curl -X PUT "$API_URL/orders/$ORDER_ID" -H "Authorization: $TOKEN" -H 'Content-Type: application/json' \
   -d '{"items":[{"itemId":"SKU-1001","productName":"Wireless Mouse","quantity":2,"unitPrice":24.99}]}'
+# 202 {"orderId": "...", "status": "ACCEPTED", "statusUrl": "/orders/...", "messageId": "..."}
+
+# Check its status (a few hundred ms later)
+curl "$API_URL/orders/$ORDER_ID" -H "Authorization: $TOKEN"
+# 200 {"orderId": "...", "status": "FULFILLED", "total": "49.98", "warehouse": "IAD-1", ...}
 ```
 
-| Response | When |
-|---|---|
-| `201 {"orderId", "itemCount", "total"}` | Order saved |
-| `400 {"message"}` | Invalid JSON / payload (empty or >25 items, duplicate `itemId`, bad quantity/price) |
-| `401` | Missing or invalid ID token |
-| `429` | API Gateway throttling (100 rps, burst 50) |
+| Request | Response | When |
+|---|---|---|
+| `PUT /orders/{orderId}` | `202 {"orderId", "status": "ACCEPTED", "statusUrl", "messageId"}` | Order queued (processing happens afterwards) |
+| | `400 {"message": "<schema violation>"}` | Body fails the JSON schema: empty/>25 items, missing field, `quantity` < 1, `unitPrice` < 0, unknown property, … |
+| | `400 {"message": "orderId must be a lowercase UUID…"}` | Path isn't a lowercase UUID |
+| | `415` | `Content-Type` other than `application/json` |
+| `GET /orders/{orderId}` | `200 {"orderId", "status", "acceptedAt", "createdAt", "total", "itemCount", ["warehouse", "fulfilledAt"] / ["reason"]}` | `status`: `CREATED`, `FULFILLED`, or `REJECTED` (with `reason`, e.g. duplicate `itemId`) |
+| | `404` | Unknown id, not processed yet, or another customer's order |
+| both | `401` | Missing or invalid ID token |
+| both | `429` | API Gateway throttling (100 rps, burst 50) |
 
 ## CI/CD
 
@@ -292,6 +319,26 @@ one per account, so the template references its ARN instead of creating it.
   a crash between the DynamoDB write and `PutEvents` loses the event. Exercise 8 revisits it;
   the alternatives are DynamoDB Streams → EventBridge Pipes (transactional outbox) or retrying
   from a processing state on the order header.
+- **Async API = API Gateway → SQS direct integration, no Lambda in the request path** — the
+  client gets 202 as soon as the order is durably queued; CreateOrder can be slow, throttled,
+  cold or briefly broken without affecting the API (messages wait in the queue for up to 4 days).
+  The trade-off: the client must poll (`GET /orders/{orderId}`) or subscribe to notifications
+  to learn the outcome, and validation errors found later can only be reported via status.
+- **`PUT /orders/{orderId}` with a client-generated UUID** — PUT is idempotent by HTTP
+  definition and the id is the natural idempotency key for exercise 8. It also has a practical
+  reason: a direct integration's response template can read path parameters but not the request
+  body, so a body-only `orderId` couldn't be echoed in the 202.
+- **Validation at the edge (JSON-schema model) + defence in depth in CreateOrder** — bad requests
+  are rejected with 400 before anything is queued; rules a schema can't express (duplicate
+  `itemId`s) are checked by CreateOrder and stored as `REJECTED` (not retried — retrying can't fix
+  the payload). API Gateway doesn't validate path parameter formats, so the UUID check lives in the
+  mapping template (an invalid id produces a deliberately invalid SQS action → 400).
+- **Identity in message attributes, set by API Gateway** — `customerId` comes from
+  `$context.authorizer.claims.sub`; the schema forbids unknown properties, so a client can't
+  smuggle a `customerId` into the body.
+- **Status endpoint as a second direct integration (`BatchGetItem`)** — one call reads both
+  tables; ownership is enforced in the response template (`customerId` must equal the caller's
+  `sub`, otherwise 404 — no difference between "not yours" and "doesn't exist").
 - **EventBridge → SQS → Lambda instead of EventBridge → Lambda directly** — the queue buffers
   bursts, controls consumer concurrency, keeps messages for 4 days if the consumer is broken, and
   gives a place for a dead-letter queue (exercise 7).
@@ -460,3 +507,60 @@ order header, SQS `SentTimestamp` / `ApproximateFirstReceiveTimestamp`, and `ful
   instead of ~0.25 s — every deployment replaces the function versions.
 - The stack was first created with local credentials and is now updated by CloudFormation using
   the execution role; switching roles on an existing stack needed no changes.
+
+### Exercise 6 — asynchronous API (measured 2026-10-18, us-east-1)
+
+**API latency, synchronous vs asynchronous** (API Gateway's own metrics, stage `prod`):
+
+| | Sync `POST /orders` → Lambda (ex. 0–5) | Async `PUT /orders/{id}` → SQS |
+|---|---|---|
+| `Latency` p50 / p90 / p99 | 81 / 150 / **1,396 ms** | 31 / 98 / **107 ms** |
+| `IntegrationLatency` p50 / p99 | 54 / 1,271 ms | 35 / 40 ms |
+| `curl` round trip, warm | 0.16–0.24 s | 0.11–0.19 s |
+| Cold start visible to the client | yes (1.4–1.6 s first request) | **no** — Lambda isn't in the request path |
+
+The tail is the real win: p99 drops from 1.4 s (Lambda cold starts) to ~0.1 s. (The async
+window mixes PUT and GET calls and includes 400/401 responses that never reach an integration.)
+
+**Where the time goes now** (`scripts/measure_fulfilment.py`, ms, min / median / max):
+
+| Stage | 10 orders, 2 s apart | 20 orders back to back |
+|---|---|---|
+| `PUT` round trip seen by the client (warm, Python) | 157 / 175 / 209 | 98 / 147 / 327 |
+| Accepted by API → order saved by CreateOrder | 109 / 128 / 158 | 54 / 110 / 159 |
+| Saved → fulfilment queue (EventBridge) | 78 / 83 / 222 | 77 / 93 / 173 |
+| Waiting in the fulfilment queue | 1 / 2 / 9 | 1 / 2 / 11 |
+| Received → fulfilled | 39 / 44 / 73 | 35 / 37 / 52 |
+| **Accepted → fulfilled** | **236 / 261 / 428** | **175 / 250 / 338** |
+
+**Behaviour verified against the deployed API:**
+
+| Case | Result |
+|---|---|
+| Valid PUT | 202 `ACCEPTED`; GET right after → `CREATED`; 3 s later → `FULFILLED` with warehouse |
+| `orderId` = `not-a-uuid` | 400 `orderId must be a lowercase UUID…` |
+| `quantity: 0` | 400 `numeric instance is lower than the required minimum (minimum: 1, found: 0)` |
+| Extra `customerId` property in the body | 400 `object instance has properties which are not allowed by the schema: ["customerId"]` |
+| `Content-Type: text/plain` | 415 |
+| Duplicate `itemId`s (schema can't check) | 202, then GET → `REJECTED`, `reason: duplicate itemId 'A'` |
+| Second user GETs the first user's order | 404 |
+| Second user PUTs the first user's `orderId` | 202, but CreateOrder's conditional write skips it — the original order is unchanged (exercise 8 turns this into an explicit conflict) |
+| No token / old `POST /orders` | 401 / 403 (route no longer exists) |
+
+**Lessons:**
+
+- **New API deployment took ~1 minute to go live**, not the ~10 s seen in Project 3: until then
+  every call hit the *old* deployment (403 "Missing Authentication Token" for the new route, 500
+  from the removed Lambda route). The CI smoke test now retries for up to 2 minutes.
+- **VTL: a missing DynamoDB attribute is not "false".** `#if($o.total)` was true for a rejected
+  order without `total`, producing `"itemCount": ,` (invalid JSON). Test the rendered string:
+  `#if("$!o.total.N" != "")`.
+- **`$util.escapeJavaScript` escapes `'` as `\'`**, which is invalid JSON — the rejection reason
+  `duplicate itemId 'A'` broke the response until `.replaceAll("\\'", "'")` was added.
+- **Path parameters aren't format-validated** by API Gateway's request validator (only presence),
+  hence the UUID check in the mapping template.
+- **Powertools `record.message_attributes.get(name)` returns the raw dict**; only
+  `message_attributes[name]` wraps it in `SQSMessageAttribute` (`.string_value`). Found by the
+  unit tests.
+- Schema errors include noise such as `format attribute "int32" not supported` — the message is
+  API Gateway's validator output, returned as-is via the `BAD_REQUEST_BODY` gateway response.

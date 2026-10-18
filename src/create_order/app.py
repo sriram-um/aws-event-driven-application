@@ -1,15 +1,19 @@
-"""CreateOrder Lambda: validates an order payload, saves it as one header item plus one item
-per order line in a single DynamoDB transaction, then publishes an OrderCreated event to the
-application's EventBridge bus."""
+"""CreateOrder Lambda: consumes accepted orders from the intake SQS queue (fed directly by
+API Gateway, PUT /orders/{orderId}), saves each as one header item plus one item per order line
+in a single DynamoDB transaction, then publishes an OrderCreated event to the orders bus.
+
+The API has already validated the body against a JSON schema and returned 202; the checks a
+schema can't express (e.g. duplicate itemIds) happen here, and orders that fail them are stored
+with status REJECTED so GET /orders/{orderId} can report why."""
 import json
 import os
-import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import boto3
 from aws_lambda_powertools import Logger, Tracer
-from aws_lambda_powertools.logging import correlation_paths
+from aws_lambda_powertools.utilities.batch import BatchProcessor, EventType, process_partial_response
+from aws_lambda_powertools.utilities.data_classes.sqs_event import SQSRecord
 from boto3.dynamodb.types import TypeSerializer
 
 logger = Logger()
@@ -24,20 +28,13 @@ EVENT_SOURCE = "orders.service"
 dynamodb = boto3.client("dynamodb")
 events = boto3.client("events")
 serializer = TypeSerializer()
+processor = BatchProcessor(event_type=EventType.SQS)
 
 MAX_ITEMS = 25  # header + 25 lines stays well inside the 100-action transaction limit
 
 
 class ValidationError(Exception):
     pass
-
-
-def _response(status_code, body):
-    return {
-        "statusCode": status_code,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
-    }
 
 
 def _parse_items(payload):
@@ -77,10 +74,16 @@ def _parse_items(payload):
     return parsed
 
 
-def _customer_id(event):
-    # Identity comes from the verified Cognito token, never from the request body
-    claims = (event.get("requestContext") or {}).get("authorizer", {}).get("claims") or {}
-    return claims.get("sub", "anonymous")
+def _attribute(record: SQSRecord, name):
+    attrs = record.message_attributes
+    # Index rather than .get(): only __getitem__ wraps the value in SQSMessageAttribute
+    if name not in attrs or not attrs[name].string_value:
+        raise ValidationError(f"message attribute '{name}' is missing")
+    return attrs[name].string_value
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _put(item, condition=None):
@@ -90,9 +93,15 @@ def _put(item, condition=None):
     return {"Put": action}
 
 
+def _is_duplicate(err):
+    """True when the header's attribute_not_exists condition failed (orderId already used)."""
+    reasons = err.response.get("CancellationReasons") or []
+    return bool(reasons) and reasons[0].get("Code") == "ConditionalCheckFailed"
+
+
 @tracer.capture_method
-def _save_order(order_id, customer_id, items, total):
-    created_at = datetime.now(timezone.utc).isoformat()
+def _save_order(order_id, customer_id, items, total, accepted_at):
+    created_at = _now()
     header = {
         "orderId": order_id,
         "sk": "ORDER",
@@ -100,6 +109,7 @@ def _save_order(order_id, customer_id, items, total):
         "status": "CREATED",
         "total": total,
         "itemCount": len(items),
+        "acceptedAt": accepted_at,
         "createdAt": created_at,
     }
     lines = [{"orderId": order_id, "sk": f"ITEM#{item['itemId']}", **item} for item in items]
@@ -109,6 +119,22 @@ def _save_order(order_id, customer_id, items, total):
         *(_put(line) for line in lines),
     ])
     return created_at
+
+
+@tracer.capture_method
+def _save_rejected(order_id, customer_id, reason, accepted_at):
+    try:
+        dynamodb.put_item(**_put({
+            "orderId": order_id,
+            "sk": "ORDER",
+            "customerId": customer_id,
+            "status": "REJECTED",
+            "reason": reason,
+            "acceptedAt": accepted_at,
+            "createdAt": _now(),
+        }, condition="attribute_not_exists(orderId)")["Put"])
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        logger.warning("rejected order id already exists, not overwriting", extra={"orderId": order_id})
 
 
 @tracer.capture_method
@@ -134,36 +160,51 @@ def _publish_order_created(order_id, customer_id, items, total, created_at):
     return resp["Entries"][0]["EventId"]
 
 
-@logger.inject_lambda_context(correlation_id_path=correlation_paths.API_GATEWAY_REST)
-@tracer.capture_lambda_handler
-def lambda_handler(event, context):
-    try:
-        payload = json.loads(event.get("body") or "{}")
-        if not isinstance(payload, dict):
-            raise ValidationError("request body must be a JSON object")
-        items = _parse_items(payload)
-    except json.JSONDecodeError:
-        logger.warning("rejected order: invalid JSON")
-        return _response(400, {"message": "request body must be valid JSON"})
-    except ValidationError as err:
-        logger.warning("rejected order", extra={"reason": str(err)})
-        return _response(400, {"message": str(err)})
+def record_handler(record: SQSRecord):
+    # Set by the API Gateway mapping template: orderId (validated UUID from the path),
+    # customerId (verified Cognito sub), acceptedAt (request time, epoch ms), requestId
+    order_id = _attribute(record, "orderId")
+    customer_id = _attribute(record, "customerId")
+    accepted_at = datetime.fromtimestamp(int(_attribute(record, "acceptedAt")) / 1000, timezone.utc).isoformat()
+    logger.set_correlation_id(_attribute(record, "requestId"))  # API Gateway request id
 
-    order_id = str(uuid.uuid4())
-    customer_id = _customer_id(event)
-    tracer.put_annotation(key="orderId", value=order_id)
+    try:
+        payload = json.loads(record.body)
+        if not isinstance(payload, dict):
+            raise ValidationError("order body must be a JSON object")
+        items = _parse_items(payload)
+    except (json.JSONDecodeError, ValidationError) as err:
+        # Permanent failure: retrying can't fix the payload, so record it and move on
+        reason = str(err) if isinstance(err, ValidationError) else "order body must be valid JSON"
+        logger.warning("order rejected", extra={"orderId": order_id, "reason": reason})
+        _save_rejected(order_id, customer_id, reason, accepted_at)
+        return
 
     total = sum(i["unitPrice"] * i["quantity"] for i in items)
-    created_at = _save_order(order_id, customer_id, items, total)
+    tracer.put_annotation(key="orderId", value=order_id)
+    try:
+        created_at = _save_order(order_id, customer_id, items, total, accepted_at)
+    except dynamodb.exceptions.TransactionCanceledException as err:
+        if not _is_duplicate(err):
+            raise  # e.g. throttling - let SQS retry the message
+        # Same orderId seen before (client retry or SQS redelivery). Exercise 8 turns this into
+        # full idempotency (same result, payload check, in-progress state).
+        logger.info("order already exists, skipping", extra={"orderId": order_id})
+        return
 
-    # Published only after the order is durably saved. If publishing fails the order still
-    # exists, so we don't fail the request (a client retry would create a duplicate order);
-    # the error is logged for alerting. Exercise 8 (idempotency) revisits this dual write.
+    # The order is saved; a publish failure is logged rather than retried, because a retry
+    # would now be skipped as a duplicate (the dual-write gap that exercise 8 closes).
     try:
         event_id = _publish_order_created(order_id, customer_id, items, total, created_at)
-        logger.info("OrderCreated published", extra={"orderId": order_id, "eventId": event_id})
+        logger.info("order created", extra={
+            "orderId": order_id, "itemCount": len(items), "total": str(total), "eventId": event_id,
+            "receiveCount": int(record.attributes.approximate_receive_count)})
     except Exception:
         logger.exception("OrderCreated publish failed", extra={"orderId": order_id})
 
-    logger.info("order created", extra={"orderId": order_id, "itemCount": len(items), "total": str(total)})
-    return _response(201, {"orderId": order_id, "itemCount": len(items), "total": str(total)})
+
+@logger.inject_lambda_context
+@tracer.capture_lambda_handler
+def lambda_handler(event, context):
+    return process_partial_response(
+        event=event, record_handler=record_handler, processor=processor, context=context)

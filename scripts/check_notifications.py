@@ -10,7 +10,7 @@ import statistics
 import sys
 import time
 
-from measure_fulfilment import ms, outputs, post_order, session, token
+from measure_fulfilment import ms, outputs, put_order, session, token
 
 
 def main(count=3):
@@ -19,7 +19,7 @@ def main(count=3):
     orders_table = session.resource("dynamodb").Table(outputs["OrdersTableName"])
 
     id_token = token()
-    order_ids = {post_order(id_token) for _ in range(count)}
+    order_ids = {put_order(id_token)[0] for _ in range(count)}
 
     received, deadline = {}, time.time() + 60
     while len(received) < 2 * count and time.time() < deadline:

@@ -79,13 +79,23 @@ jobs:
         run: |
           API_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
-          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/orders" -d '{}')
-          echo "POST /orders without token -> HTTP $code"
-          test "$code" = "401"
+          ORDER_URL="$API_URL/orders/$(uuidgen | tr 'A-Z' 'a-z')"
+          for method in PUT GET; do
+            # A new API deployment can take ~1 min to go live; until then the stage serves the
+            # previous one (an unknown route answers 403), so retry for up to 2 minutes
+            for attempt in $(seq 12); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" -X $method "$ORDER_URL" \
+                -H 'Content-Type: application/json' -d '{"items":[]}')
+              echo "$method /orders/{orderId} without token -> HTTP $code (attempt $attempt)"
+              [ "$code" = "401" ] && break
+              sleep 10
+            done
+            test "$code" = "401"
+          done
 
       - name: Smoke test - event-driven resources are in the stack outputs
         run: |
-          for key in EventBusName FulfilmentQueueUrl OrderNotificationsTopicArn DashboardUrl; do
+          for key in EventBusName OrderIntakeQueueUrl FulfilmentQueueUrl OrderNotificationsTopicArn DashboardUrl; do
             value=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
               --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text)
             echo "$key = $value"
