@@ -70,17 +70,21 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub '${AWS::StackName}-CreateOrder'
-      Description: Validates orders and saves them to the Orders table
+      Description: Validates orders, saves them to the Orders table and publishes OrderCreated
       CodeUri: src/create_order/
       Handler: app.lambda_handler
       Environment:
         Variables:
           TABLE_NAME: !Ref OrdersTable
+          EVENT_BUS_NAME: !Ref OrdersEventBus
       Policies:
         # Least privilege: write actions on this table only (TransactWriteItems is
         # authorised per contained PutItem)
         - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
+        # Exercise 1: events:PutEvents on the orders bus only
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref OrdersEventBus
       Events:
         CreateOrder:
           Type: Api
@@ -121,6 +125,57 @@ Resources:
           MetricsEnabled: true
       Tags:
         project: event-driven-orders
+
+  # ---------------------------------------------------------------------------
+  # Exercise 1: custom EventBridge bus - CreateOrder publishes OrderCreated here
+  # ---------------------------------------------------------------------------
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-bus'
+      Description: Order domain events (source orders.service)
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  # Debug/audit trail: every orders.service event is copied to CloudWatch Logs so the
+  # events can be inspected (and searched with Logs Insights) without a consumer.
+  OrderEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # EventBridge log targets must live under /aws/events/
+      LogGroupName: !Sub '/aws/events/${AWS::StackName}'
+      RetentionInDays: 14
+
+  OrderEventsLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-events-to-logs'
+      # Allows EventBridge to write to this log group only
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${OrderEventsLogGroup.Arn}"
+          }]
+        }
+
+  OrderEventsToLogsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-all-order-events-to-logs'
+      Description: Copies every orders.service event to CloudWatch Logs
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source:
+          - orders.service
+      State: ENABLED
+      Targets:
+        - Id: order-events-log-group
+          Arn: !GetAtt OrderEventsLogGroup.Arn
 
   UserPool:
     Type: AWS::Cognito::UserPool
@@ -182,6 +237,15 @@ Outputs:
   UserPoolClientId:
     Description: Cognito app client id (used to obtain tokens)
     Value: !Ref UserPoolClient
+  EventBusName:
+    Description: EventBridge bus receiving order events
+    Value: !Ref OrdersEventBus
+  EventBusArn:
+    Description: ARN of the orders event bus
+    Value: !GetAtt OrdersEventBus.Arn
+  OrderEventsLogGroupName:
+    Description: CloudWatch log group with a copy of every order event
+    Value: !Ref OrderEventsLogGroup
   CreateOrderFunctionName:
     Description: Name of the CreateOrder Lambda function
     Value: !Ref CreateOrderFunction

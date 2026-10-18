@@ -10,6 +10,7 @@ from moto import mock_aws
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "create_order"
 TABLE = "test-orders"
+BUS = "test-bus"
 
 
 @dataclass
@@ -26,6 +27,7 @@ CTX = FakeLambdaContext()
 @pytest.fixture
 def app(monkeypatch):
     monkeypatch.setenv("TABLE_NAME", TABLE)
+    monkeypatch.setenv("EVENT_BUS_NAME", BUS)
     monkeypatch.setenv("POWERTOOLS_TRACE_DISABLED", "true")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -44,6 +46,7 @@ def app(monkeypatch):
                 {"AttributeName": "sk", "KeyType": "RANGE"},
             ],
         )
+        boto3.client("events").create_event_bus(Name=BUS)
         sys.path.insert(0, str(SRC))
         module = importlib.reload(importlib.import_module("app"))
         yield module
@@ -56,6 +59,20 @@ def _event(body):
 
 def _rows():
     return boto3.resource("dynamodb").Table(TABLE).scan()["Items"]
+
+
+@pytest.fixture
+def published(app, monkeypatch):
+    """Records PutEvents entries while still calling the (moto) EventBridge API."""
+    entries = []
+    real_put_events = app.events.put_events
+
+    def recorder(**kwargs):
+        entries.extend(kwargs["Entries"])
+        return real_put_events(**kwargs)
+
+    monkeypatch.setattr(app.events, "put_events", recorder)
+    return entries
 
 
 def test_creates_header_and_one_row_per_item(app):
@@ -103,3 +120,42 @@ def test_rejects_invalid_payloads(app, body):
     resp = app.lambda_handler(_event(body), CTX)
     assert resp["statusCode"] == 400
     assert _rows() == []
+
+
+def test_publishes_order_created_event(app, published):
+    event = _event({"items": [{"itemId": "A", "productName": "Mouse", "quantity": 2, "unitPrice": 10.5}]})
+    event["requestContext"] = {"authorizer": {"claims": {"sub": "user-123"}}}
+    body = json.loads(app.lambda_handler(event, CTX)["body"])
+
+    assert len(published) == 1
+    entry = published[0]
+    assert entry["EventBusName"] == BUS
+    assert entry["Source"] == "orders.service"
+    assert entry["DetailType"] == "OrderCreated"
+    detail = json.loads(entry["Detail"])
+    assert detail["orderId"] == body["orderId"]
+    assert detail["customerId"] == "user-123"
+    assert detail["total"] == "21.0"
+    assert detail["items"] == [{"itemId": "A", "productName": "Mouse", "quantity": 2, "unitPrice": "10.5"}]
+
+
+def test_no_event_for_rejected_order(app, published):
+    app.lambda_handler(_event({"items": []}), CTX)
+    assert published == []
+
+
+@pytest.mark.parametrize("failure", [
+    {"FailedEntryCount": 1, "Entries": [{"ErrorCode": "InternalFailure", "ErrorMessage": "boom"}]},
+    RuntimeError("network"),
+])
+def test_publish_failure_still_returns_created(app, monkeypatch, failure):
+    def failing_put_events(**kwargs):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(app.events, "put_events", failing_put_events)
+    resp = app.lambda_handler(_event({"items": [{"itemId": "A", "quantity": 1, "unitPrice": 1}]}), CTX)
+    # The order is saved, so the client must not retry and create a duplicate
+    assert resp["statusCode"] == 201
+    assert any(r["sk"] == "ORDER" for r in _rows())

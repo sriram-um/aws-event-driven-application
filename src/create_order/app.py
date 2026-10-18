@@ -1,5 +1,6 @@
-"""CreateOrder Lambda: validates an order payload and saves it as one header item plus one
-item per order line, in a single DynamoDB transaction."""
+"""CreateOrder Lambda: validates an order payload, saves it as one header item plus one item
+per order line in a single DynamoDB transaction, then publishes an OrderCreated event to the
+application's EventBridge bus."""
 import json
 import os
 import uuid
@@ -18,7 +19,10 @@ logger.append_keys(app_version=os.environ.get("APP_VERSION", "local"))  # git SH
 tracer = Tracer(patch_modules=["botocore"])
 
 TABLE_NAME = os.environ["TABLE_NAME"]
+EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
+EVENT_SOURCE = "orders.service"
 dynamodb = boto3.client("dynamodb")
+events = boto3.client("events")
 serializer = TypeSerializer()
 
 MAX_ITEMS = 25  # header + 25 lines stays well inside the 100-action transaction limit
@@ -107,6 +111,29 @@ def _save_order(order_id, customer_id, items, total):
     return created_at
 
 
+@tracer.capture_method
+def _publish_order_created(order_id, customer_id, items, total, created_at):
+    detail = {
+        "orderId": order_id,
+        "customerId": customer_id,
+        "items": [{**item, "unitPrice": str(item["unitPrice"])} for item in items],
+        "itemCount": len(items),
+        "total": str(total),
+        "createdAt": created_at,
+    }
+    resp = events.put_events(Entries=[{
+        "EventBusName": EVENT_BUS_NAME,
+        "Source": EVENT_SOURCE,
+        "DetailType": "OrderCreated",
+        "Detail": json.dumps(detail),
+    }])
+    # PutEvents reports per-entry failures in the response instead of raising
+    if resp.get("FailedEntryCount"):
+        entry = resp["Entries"][0]
+        raise RuntimeError(f"{entry.get('ErrorCode')}: {entry.get('ErrorMessage')}")
+    return resp["Entries"][0]["EventId"]
+
+
 @logger.inject_lambda_context(correlation_id_path=correlation_paths.API_GATEWAY_REST)
 @tracer.capture_lambda_handler
 def lambda_handler(event, context):
@@ -127,7 +154,16 @@ def lambda_handler(event, context):
     tracer.put_annotation(key="orderId", value=order_id)
 
     total = sum(i["unitPrice"] * i["quantity"] for i in items)
-    _save_order(order_id, customer_id, items, total)
+    created_at = _save_order(order_id, customer_id, items, total)
+
+    # Published only after the order is durably saved. If publishing fails the order still
+    # exists, so we don't fail the request (a client retry would create a duplicate order);
+    # the error is logged for alerting. Exercise 8 (idempotency) revisits this dual write.
+    try:
+        event_id = _publish_order_created(order_id, customer_id, items, total, created_at)
+        logger.info("OrderCreated published", extra={"orderId": order_id, "eventId": event_id})
+    except Exception:
+        logger.exception("OrderCreated publish failed", extra={"orderId": order_id})
 
     logger.info("order created", extra={"orderId": order_id, "itemCount": len(items), "total": str(total)})
     return _response(201, {"orderId": order_id, "itemCount": len(items), "total": str(total)})

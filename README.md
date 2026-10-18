@@ -17,7 +17,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | # | Exercise | Services | Status |
 |---|---|---|---|
 | 0 | Baseline orders API | API Gateway, Lambda, DynamoDB, Cognito | ✅ Done |
-| 1 | Publish events | EventBridge | ⬜ |
+| 1 | Publish events | EventBridge | ✅ Done |
 | 2 | Process messages | SQS, Lambda, DynamoDB | ⬜ |
 | 3 | Send notifications | SNS | ⬜ |
 | 4 | Monitoring | CloudWatch dashboard | ⬜ |
@@ -40,14 +40,22 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
  HTTPS       │ API Gateway (REST)      │─────►│ Lambda: CreateOrder        │─────►│ DynamoDB: Orders          │
  Authorization│ stage prod · REGIONAL  │proxy │ python3.12 / arm64 / 256MB │trans-│ PK orderId · SK sk        │
  : <IdToken> │ POST /orders            │      │ validates, Powertools logs │action│ ORDER header + ITEM# lines│
-             │ Cognito authorizer      │      └────────────────────────────┘      │ on-demand · SSE · PITR    │
-             │ throttle 100 rps/50 burst│                                         └───────────────────────────┘
-             └─────────────────────────┘
+             │ Cognito authorizer      │      └─────────────┬──────────────┘      │ on-demand · SSE · PITR    │
+             │ throttle 100 rps/50 burst│                    │ PutEvents          └───────────────────────────┘
+             └─────────────────────────┘                    │ (after the write succeeds)
+                                              ┌─────────────▼──────────────┐      ┌───────────────────────────┐
+                                              │ EventBridge custom bus     │rule  │ CloudWatch Logs           │
+                                              │ orders-event-driven-app-bus│─────►│ /aws/events/<stack>       │
+                                              │ source orders.service      │all   │ copy of every order event │
+                                              │ detail-type OrderCreated   │events│ (14-day retention)        │
+                                              └────────────────────────────┘      └───────────────────────────┘
 ```
 
 **Request path:** API Gateway (Cognito authorizer checks the JWT) → CreateOrder Lambda (validates
 the payload, takes `customerId` from the token's `sub` claim) → one DynamoDB `TransactWriteItems`
-that writes the order header and every line together, or nothing.
+that writes the order header and every line together, or nothing → `PutEvents` of an
+`OrderCreated` event to the custom bus. A rule copies every `orders.service` event to CloudWatch
+Logs for inspection; consumers (SQS, SNS) are added in exercises 2 and 3.
 
 **Observability:** X-Ray active tracing on the API stage and the Lambda; structured JSON logs
 (Powertools `Logger`, correlation id = API Gateway request id, `app_version` key).
@@ -60,6 +68,22 @@ that writes the order header and every line together, or nothing.
 |---|---|---|---|
 | Header | UUID v4 | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED`), `total` (N), `itemCount`, `createdAt` (ISO-8601 UTC) |
 | Line | same | `ITEM#<itemId>` | `itemId`, `productName`, `quantity` (N), `unitPrice` (N) |
+
+### Event: `OrderCreated`
+
+`source: orders.service`, `detail-type: OrderCreated`, bus `orders-event-driven-app-bus`.
+Money values are strings so consumers never lose precision to floats.
+
+```json
+{
+  "orderId": "adf157f7-011f-416e-974b-9c900f9d5299",
+  "customerId": "843874a8-4081-70c7-f151-d3c8ab4c97c2",
+  "items": [{"itemId": "SKU-1001", "productName": "Wireless Mouse", "quantity": 2, "unitPrice": "24.99"}],
+  "itemCount": 1,
+  "total": "49.98",
+  "createdAt": "2026-10-18T14:08:48.471944+00:00"
+}
+```
 
 A `Query` on `orderId` returns the whole order. The header item gives later exercises one place
 for order-level state (status, idempotency/processing state) without changing the table schema.
@@ -128,6 +152,20 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
 - **`TransactWriteItems` instead of `BatchWriteItem`** — atomic: a failure can't leave a partial
   order. The header put is conditional (`attribute_not_exists`), the starting point for the
   idempotency exercise.
+- **Custom event bus, not the default bus** — keeps application events apart from AWS service
+  events, gives a resource to scope IAM (`EventBridgePutEventsPolicy` on this bus only) and is
+  what EventBridge Global Endpoints need in exercise 9.
+- **Fat event (full order in `detail`)** — consumers (fulfilment, notifications) don't have to
+  call back into the Orders table; the trade-off is a larger event and a contract to keep stable.
+- **Publish after the write, never fail the request on a publish error** — the order is already
+  saved, so returning 5xx would make the client retry and create a *duplicate* order. Failures are
+  logged (`OrderCreated publish failed`) instead. This is the classic **dual-write problem**:
+  a crash between the DynamoDB write and `PutEvents` loses the event. Exercise 8 revisits it;
+  the alternatives are DynamoDB Streams → EventBridge Pipes (transactional outbox) or retrying
+  from a processing state on the order header.
+- **Log-group rule as a debug/audit trail** — makes every event visible (and queryable with Logs
+  Insights) before any consumer exists. Log targets must be under `/aws/events/` and need a
+  CloudWatch Logs **resource policy** allowing `events.amazonaws.com`.
 - **Cognito authorizer as the default for every route**; `customerId` comes from the verified
   token, never from the body.
 - **Nothing bundled** — boto3 comes from the runtime and Powertools from the pinned public layer
@@ -149,3 +187,20 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
 - No token → `401` from the Cognito authorizer; invalid payload → `400` with the reason.
 - The Init Duration (~0.7 s) is mostly importing the Powertools Logger/Tracer and the X-Ray SDK,
   the same trade-off seen in Project 3.
+
+### Exercise 1 — EventBridge (measured 2026-10-18, us-east-1)
+
+| Measurement | Before (ex. 0) | After |
+|---|---|---|
+| Warm Lambda Duration | 23–27 ms | 36–44 ms (+~15 ms for `PutEvents`) |
+| Cold start: Init / Duration | 716 / 178 ms | 699 / 271 ms (first `events` client call) |
+| End-to-end `curl` latency, warm | 0.16–0.24 s | 0.17–0.20 s (no visible change) |
+| Order written → event ingested in CloudWatch Logs | — | 350–590 ms |
+
+- 6 valid orders → 6 `OrderCreated` events in the log group, 0 publish failures; a rejected order
+  (400) publishes nothing.
+- The event's `time` field has **1-second precision**, so it can be up to ~1 s *earlier* than
+  `createdAt` — use `detail.createdAt` (or the log ingestion time) for latency measurements.
+- Rule metrics (`AWS/Events` `MatchedEvents`, `Invocations`, dims `EventBusName` + `RuleName`)
+  arrive with a few minutes' delay — the first query showed 5 matched vs 6 invocations;
+  a few minutes later both were 6.
