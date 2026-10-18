@@ -4,9 +4,18 @@ in a single DynamoDB transaction, then publishes an OrderCreated event to the or
 
 The API has already validated the body against a JSON schema and returned 202; the checks a
 schema can't express (e.g. duplicate itemIds) happen here, and orders that fail them are stored
-with status REJECTED so GET /orders/{orderId} can report why."""
+with status REJECTED so GET /orders/{orderId} can report why.
+
+Idempotency (exercise 8): orderId is the idempotency key. The order header doubles as the
+idempotency record - it stores a hash of the request (customer + items), a processing state
+(IN_PROGRESS -> COMPLETED), which SQS message claimed it and until when (lock). Conditional
+writes decide who processes an order, so duplicates (client retries, SQS redelivery, concurrent
+copies) never create a second order or a second OrderCreated, and an order whose event could
+not be published is resumed by the retry instead of being lost."""
+import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -14,7 +23,7 @@ import boto3
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.batch import BatchProcessor, EventType, process_partial_response
 from aws_lambda_powertools.utilities.data_classes.sqs_event import SQSRecord
-from boto3.dynamodb.types import TypeSerializer
+from botocore.exceptions import ClientError
 
 logger = Logger()
 logger.append_keys(app_version=os.environ.get("APP_VERSION", "local"))  # git SHA set by CI
@@ -25,12 +34,17 @@ tracer = Tracer(patch_modules=["botocore"])
 TABLE_NAME = os.environ["TABLE_NAME"]
 EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
 EVENT_SOURCE = "orders.service"
-dynamodb = boto3.client("dynamodb")
+table = boto3.resource("dynamodb").Table(TABLE_NAME)
+# The resource's client takes plain Python values (it serializes them), also in transactions
+dynamodb = table.meta.client
 events = boto3.client("events")
-serializer = TypeSerializer()
 processor = BatchProcessor(event_type=EventType.SQS)
 
 MAX_ITEMS = 25  # header + 25 lines stays well inside the 100-action transaction limit
+# A claim expires after this long. Longer than the function timeout (10 s), so a live
+# invocation never loses its claim; shorter than the queue's visibility timeout (60 s), so the
+# message's own retry always finds the lock expired and can resume.
+LOCK_SECONDS = 30
 
 
 class ValidationError(Exception):
@@ -74,6 +88,17 @@ def _parse_items(payload):
     return parsed
 
 
+def _payload_hash(customer_id, items):
+    """Fingerprint of what was ordered and by whom: the same request always hashes the same
+    (item order and number formatting don't matter), any real difference changes it."""
+    canonical = {
+        "customerId": customer_id,
+        "items": sorted(({**i, "unitPrice": format(i["unitPrice"].normalize(), "f")} for i in items),
+                        key=lambda i: i["itemId"]),
+    }
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+
+
 def _attribute(record: SQSRecord, name):
     attrs = record.message_attributes
     # Index rather than .get(): only __getitem__ wraps the value in SQSMessageAttribute
@@ -87,21 +112,25 @@ def _now():
 
 
 def _put(item, condition=None):
-    action = {"TableName": TABLE_NAME, "Item": {k: serializer.serialize(v) for k, v in item.items()}}
+    action = {"TableName": TABLE_NAME, "Item": item}
     if condition:
         action["ConditionExpression"] = condition
     return {"Put": action}
 
 
-def _is_duplicate(err):
-    """True when the header's attribute_not_exists condition failed (orderId already used)."""
+def _condition_failed(err):
+    """True when a conditional write lost (single write or the header in a transaction)."""
+    code = err.response["Error"]["Code"]
+    if code == "ConditionalCheckFailedException":
+        return True
     reasons = err.response.get("CancellationReasons") or []
-    return bool(reasons) and reasons[0].get("Code") == "ConditionalCheckFailed"
+    return code == "TransactionCanceledException" and bool(reasons) and reasons[0].get("Code") == "ConditionalCheckFailed"
 
 
 @tracer.capture_method
-def _save_order(order_id, customer_id, items, total, accepted_at):
-    created_at = _now()
+def _claim(order_id, customer_id, items, total, accepted_at, payload_hash, message_id):
+    """Creates the order (header + lines) and claims it for this message - or raises if the
+    orderId already exists."""
     header = {
         "orderId": order_id,
         "sk": "ORDER",
@@ -110,15 +139,65 @@ def _save_order(order_id, customer_id, items, total, accepted_at):
         "total": total,
         "itemCount": len(items),
         "acceptedAt": accepted_at,
-        "createdAt": created_at,
+        "createdAt": _now(),
+        "payloadHash": payload_hash,
+        "processingState": "IN_PROGRESS",
+        "claimedBy": message_id,
+        "lockExpiresAt": int(time.time()) + LOCK_SECONDS,
     }
     lines = [{"orderId": order_id, "sk": f"ITEM#{item['itemId']}", **item} for item in items]
-    # All-or-nothing: an order never exists without its lines (or vice versa)
+    # All-or-nothing: the order, its lines and the claim are written together. The condition
+    # makes concurrent copies of the same order race safely - exactly one transaction wins.
     dynamodb.transact_write_items(TransactItems=[
         _put(header, condition="attribute_not_exists(orderId)"),
         *(_put(line) for line in lines),
     ])
-    return created_at
+    return header
+
+
+def _existing(order_id):
+    return table.get_item(Key={"orderId": order_id, "sk": "ORDER"}, ConsistentRead=True)["Item"]
+
+
+@tracer.capture_method
+def _take_over(order_id, payload_hash, message_id):
+    """Re-claims an IN_PROGRESS order whose earlier attempt didn't finish: either this same
+    message's previous receive, or another message whose lock has expired."""
+    try:
+        return table.update_item(
+            Key={"orderId": order_id, "sk": "ORDER"},
+            UpdateExpression="SET claimedBy = :me, lockExpiresAt = :expires",
+            ConditionExpression=("processingState = :in_progress AND payloadHash = :hash "
+                                 "AND (claimedBy = :me OR lockExpiresAt < :now)"),
+            ExpressionAttributeValues={
+                ":me": message_id, ":hash": payload_hash, ":in_progress": "IN_PROGRESS",
+                ":now": int(time.time()), ":expires": int(time.time()) + LOCK_SECONDS},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+    except ClientError as err:
+        if _condition_failed(err):
+            return None
+        raise
+
+
+@tracer.capture_method
+def _complete(order_id, message_id, event_id):
+    try:
+        table.update_item(
+            Key={"orderId": order_id, "sk": "ORDER"},
+            UpdateExpression="SET processingState = :completed, eventId = :event, completedAt = :at "
+                             "REMOVE claimedBy, lockExpiresAt",
+            ConditionExpression="processingState = :in_progress AND claimedBy = :me",
+            ExpressionAttributeValues={":completed": "COMPLETED", ":in_progress": "IN_PROGRESS",
+                                       ":me": message_id, ":event": event_id, ":at": _now()},
+        )
+    except ClientError as err:
+        if not _condition_failed(err):
+            raise
+        # Our claim expired and another message took over after we published: the event may
+        # be published twice - consumers are idempotent (FulfilOrder), so that is harmless.
+        logger.warning("claim lost before completing; OrderCreated may be duplicated",
+                       extra={"orderId": order_id})
 
 
 @tracer.capture_method
@@ -132,8 +211,11 @@ def _save_rejected(order_id, customer_id, reason, accepted_at):
             "reason": reason,
             "acceptedAt": accepted_at,
             "createdAt": _now(),
+            "processingState": "COMPLETED",
         }, condition="attribute_not_exists(orderId)")["Put"])
-    except dynamodb.exceptions.ConditionalCheckFailedException:
+    except ClientError as err:
+        if not _condition_failed(err):
+            raise
         logger.warning("rejected order id already exists, not overwriting", extra={"orderId": order_id})
 
 
@@ -160,12 +242,20 @@ def _publish_order_created(order_id, customer_id, items, total, created_at):
     return resp["Entries"][0]["EventId"]
 
 
+def _result(header):
+    """The stored outcome of an order - what every duplicate request gets back."""
+    return {"orderId": header["orderId"], "status": header["status"],
+            "total": str(header.get("total", "")), "eventId": header.get("eventId")}
+
+
 def record_handler(record: SQSRecord):
     try:
-        _process(record)
+        return _process(record)
     except Exception:
         # Reported to SQS as a batch item failure; after 3 receives SQS moves it to the DLQ
+        attrs = record.message_attributes
         logger.exception("order processing failed", extra={
+            "orderId": attrs["orderId"].string_value if "orderId" in attrs else None,
             "messageId": record.message_id,
             "receiveCount": int(record.attributes.approximate_receive_count)})
         raise
@@ -178,6 +268,9 @@ def _process(record: SQSRecord):
     customer_id = _attribute(record, "customerId")
     accepted_at = datetime.fromtimestamp(int(_attribute(record, "acceptedAt")) / 1000, timezone.utc).isoformat()
     logger.set_correlation_id(_attribute(record, "requestId"))  # API Gateway request id
+    message_id = record.message_id
+    log = {"orderId": order_id, "messageId": message_id,
+           "receiveCount": int(record.attributes.approximate_receive_count)}
 
     try:
         payload = json.loads(record.body)
@@ -187,31 +280,43 @@ def _process(record: SQSRecord):
     except (json.JSONDecodeError, ValidationError) as err:
         # Permanent failure: retrying can't fix the payload, so record it and move on
         reason = str(err) if isinstance(err, ValidationError) else "order body must be valid JSON"
-        logger.warning("order rejected", extra={"orderId": order_id, "reason": reason})
+        logger.warning("order rejected", extra={**log, "reason": reason})
         _save_rejected(order_id, customer_id, reason, accepted_at)
-        return
+        return None
 
     total = sum(i["unitPrice"] * i["quantity"] for i in items)
+    payload_hash = _payload_hash(customer_id, items)
     tracer.put_annotation(key="orderId", value=order_id)
-    try:
-        created_at = _save_order(order_id, customer_id, items, total, accepted_at)
-    except dynamodb.exceptions.TransactionCanceledException as err:
-        if not _is_duplicate(err):
-            raise  # e.g. throttling - let SQS retry the message
-        # Same orderId seen before (client retry or SQS redelivery). Exercise 8 turns this into
-        # full idempotency (same result, payload check, in-progress state).
-        logger.info("order already exists, skipping", extra={"orderId": order_id})
-        return
 
-    # The order is saved; a publish failure is logged rather than retried, because a retry
-    # would now be skipped as a duplicate (the dual-write gap that exercise 8 closes).
     try:
-        event_id = _publish_order_created(order_id, customer_id, items, total, created_at)
-        logger.info("order created", extra={
-            "orderId": order_id, "itemCount": len(items), "total": str(total), "eventId": event_id,
-            "receiveCount": int(record.attributes.approximate_receive_count)})
-    except Exception:
-        logger.exception("OrderCreated publish failed", extra={"orderId": order_id})
+        header = _claim(order_id, customer_id, items, total, accepted_at, payload_hash, message_id)
+    except ClientError as err:
+        if not _condition_failed(err):
+            raise  # e.g. throttling - let SQS retry the message
+        existing = _existing(order_id)
+        if existing.get("payloadHash") != payload_hash:
+            # Same key, different request (other items or another customer): never overwrite.
+            # Permanent - consumed, not retried.
+            logger.warning("ORDER_ID_CONFLICT: orderId already used for a different request", extra={
+                **log, "existingCustomerId": existing.get("customerId"), "requestCustomerId": customer_id})
+            return None
+        # Orders saved before exercise 8 have no processingState - they are complete
+        if existing.get("processingState", "COMPLETED") == "COMPLETED":
+            logger.info("duplicate order: returning the stored result", extra={**log, **_result(existing)})
+            return _result(existing)
+        header = _take_over(order_id, payload_hash, message_id)
+        if header is None:
+            # Another message holds a live claim and will finish (or its own retry will)
+            logger.info("duplicate order in progress elsewhere: dropping", extra=log)
+            return None
+        logger.info("resuming unfinished order", extra=log)
+
+    # Not swallowed any more: if publishing fails, the record fails, SQS retries it, and the
+    # retry resumes from IN_PROGRESS (take-over) and publishes - the event can't be lost.
+    event_id = _publish_order_created(order_id, customer_id, items, total, header["createdAt"])
+    _complete(order_id, message_id, event_id)
+    logger.info("order created", extra={**log, "itemCount": len(items), "total": str(total), "eventId": event_id})
+    return {**_result(header), "status": "CREATED", "eventId": event_id}
 
 
 @logger.inject_lambda_context

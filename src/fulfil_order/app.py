@@ -2,16 +2,23 @@
 fulfilment in the Fulfilments table and publishes OrderFulfilled to the orders event bus.
 
 Messages are processed as a batch with partial failures: only the records that raise are
-returned to SQS for a retry, the rest of the batch is deleted."""
+returned to SQS for a retry, the rest of the batch is deleted.
+
+Idempotency (exercise 8): EventBridge and SQS deliver at least once, so the same OrderCreated
+can arrive more than once. The fulfilment item (one per orderId) is claimed with a conditional
+write and marked COMPLETED only after OrderFulfilled is published: duplicates are skipped, and
+a fulfilment whose event couldn't be published is resumed by the retry."""
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import boto3
 from aws_lambda_powertools import Logger, Tracer
 from aws_lambda_powertools.utilities.batch import BatchProcessor, EventType, process_partial_response
 from aws_lambda_powertools.utilities.data_classes.sqs_event import SQSRecord
+from botocore.exceptions import ClientError
 
 logger = Logger()
 logger.append_keys(app_version=os.environ.get("APP_VERSION", "local"))  # git SHA set by CI
@@ -22,6 +29,9 @@ EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
 EVENT_SOURCE = "orders.service"
 # Simulated fulfilment network: an order is always routed to the same warehouse
 WAREHOUSES = ("IAD-1", "CMH-1", "PDX-1")
+# Claim lifetime: longer than the function timeout (10 s), shorter than the queue's visibility
+# timeout (60 s) - so a message's own retry always finds an expired lock (same as CreateOrder)
+LOCK_SECONDS = 30
 
 table = boto3.resource("dynamodb").Table(TABLE_NAME)
 events = boto3.client("events")
@@ -50,8 +60,14 @@ def _warehouse(order_id):
     return WAREHOUSES[int(hashlib.sha256(order_id.encode()).hexdigest(), 16) % len(WAREHOUSES)]
 
 
+def _condition_failed(err):
+    return err.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
 @tracer.capture_method
-def _fulfil(event_id, order):
+def _claim(event_id, order, message_id):
+    """Records the fulfilment and claims it for this message, or returns None if the order
+    already has one."""
     fulfilment = {
         "orderId": order["orderId"],
         "customerId": order["customerId"],
@@ -62,9 +78,51 @@ def _fulfil(event_id, order):
         "orderCreatedAt": order["createdAt"],
         "fulfilledAt": datetime.now(timezone.utc).isoformat(),
         "sourceEventId": event_id,
+        "processingState": "IN_PROGRESS",
+        "claimedBy": message_id,
+        "lockExpiresAt": int(time.time()) + LOCK_SECONDS,
     }
-    table.put_item(Item=fulfilment)
-    return fulfilment
+    try:
+        table.put_item(Item=fulfilment, ConditionExpression="attribute_not_exists(orderId)")
+        return fulfilment
+    except ClientError as err:
+        if _condition_failed(err):
+            return None
+        raise
+
+
+@tracer.capture_method
+def _take_over(order_id, message_id):
+    """Re-claims an IN_PROGRESS fulfilment left by an earlier, unfinished attempt."""
+    try:
+        return table.update_item(
+            Key={"orderId": order_id},
+            UpdateExpression="SET claimedBy = :me, lockExpiresAt = :expires",
+            ConditionExpression="processingState = :in_progress AND (claimedBy = :me OR lockExpiresAt < :now)",
+            ExpressionAttributeValues={":me": message_id, ":in_progress": "IN_PROGRESS",
+                                       ":now": int(time.time()), ":expires": int(time.time()) + LOCK_SECONDS},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+    except ClientError as err:
+        if _condition_failed(err):
+            return None
+        raise
+
+
+@tracer.capture_method
+def _complete(order_id, message_id):
+    try:
+        table.update_item(
+            Key={"orderId": order_id},
+            UpdateExpression="SET processingState = :completed REMOVE claimedBy, lockExpiresAt",
+            ConditionExpression="processingState = :in_progress AND claimedBy = :me",
+            ExpressionAttributeValues={":completed": "COMPLETED", ":in_progress": "IN_PROGRESS", ":me": message_id},
+        )
+    except ClientError as err:
+        if not _condition_failed(err):
+            raise
+        logger.warning("claim lost before completing; OrderFulfilled may be duplicated",
+                       extra={"orderId": order_id})
 
 
 @tracer.capture_method
@@ -75,7 +133,8 @@ def _publish_order_fulfilled(fulfilment):
         "EventBusName": EVENT_BUS_NAME,
         "Source": EVENT_SOURCE,
         "DetailType": "OrderFulfilled",
-        "Detail": json.dumps(detail),
+        # A resumed fulfilment is read back from DynamoDB, where numbers are Decimal
+        "Detail": json.dumps(detail, default=lambda d: int(d) if d == d.to_integral_value() else str(d)),
     }])
     if resp.get("FailedEntryCount"):
         entry = resp["Entries"][0]
@@ -86,9 +145,24 @@ def record_handler(record: SQSRecord):
     receive_count = int(record.attributes.approximate_receive_count)
     try:
         event_id, order = _parse(record)
-        fulfilment = _fulfil(event_id, order)
-        # Unlike the API path, failing here is safe: the record goes back to SQS and is retried
+        fulfilment = _claim(event_id, order, record.message_id)
+        if fulfilment is None:
+            existing = table.get_item(Key={"orderId": order["orderId"]}, ConsistentRead=True)["Item"]
+            # Fulfilments recorded before exercise 8 have no processingState - they are complete
+            if existing.get("processingState", "COMPLETED") == "COMPLETED":
+                logger.info("duplicate OrderCreated: already fulfilled", extra={
+                    "orderId": order["orderId"], "messageId": record.message_id, "eventId": event_id,
+                    "firstEventId": existing.get("sourceEventId")})
+                return
+            fulfilment = _take_over(order["orderId"], record.message_id)
+            if fulfilment is None:
+                logger.info("duplicate OrderCreated in progress elsewhere: dropping", extra={
+                    "orderId": order["orderId"], "messageId": record.message_id})
+                return
+            logger.info("resuming unfinished fulfilment", extra={"orderId": order["orderId"]})
+        # Failing here is safe: the record goes back to SQS and the retry resumes the claim
         _publish_order_fulfilled(fulfilment)
+        _complete(order["orderId"], record.message_id)
     except Exception:
         logger.exception("fulfilment failed", extra={
             "messageId": record.message_id, "receiveCount": receive_count})

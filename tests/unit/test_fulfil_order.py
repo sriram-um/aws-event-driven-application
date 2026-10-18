@@ -147,3 +147,32 @@ def test_whole_batch_failure_raises(app, monkeypatch):
     monkeypatch.setattr(app.events, "put_events", _failing_put_events)
     with pytest.raises(BatchProcessingError):
         app.lambda_handler(_sqs_event(_order_created("o-1")), CTX)
+
+
+# --- Exercise 8: idempotency -----------------------------------------------------------------
+
+def test_duplicate_order_created_is_fulfilled_once(app, published):
+    app.lambda_handler(_sqs_event(_order_created("o-1")), CTX)
+    first = _fulfilments()["o-1"]
+    # The same order delivered again (EventBridge/SQS at-least-once, or a re-published event)
+    duplicate = _order_created("o-1") | {"id": "evt-o-1-again"}
+    resp = app.lambda_handler(_sqs_event(duplicate, _order_created("o-1")), CTX)
+
+    assert resp == {"batchItemFailures": []}
+    assert len(published) == 1
+    assert _fulfilments()["o-1"] == first
+    assert first["processingState"] == "COMPLETED"
+
+
+def test_publish_failure_is_resumed_by_the_retry(app, monkeypatch, published):
+    recorder = app.events.put_events  # the published fixture
+    monkeypatch.setattr(app.events, "put_events", _failing_put_events)
+    with pytest.raises(BatchProcessingError):
+        app.lambda_handler(_sqs_event(_order_created("o-1")), CTX)
+    assert _fulfilments()["o-1"]["processingState"] == "IN_PROGRESS"
+
+    monkeypatch.setattr(app.events, "put_events", recorder)
+    resp = app.lambda_handler(_sqs_event(_order_created("o-1")), CTX)  # same messageId = SQS retry
+    assert resp == {"batchItemFailures": []}
+    assert _fulfilments()["o-1"]["processingState"] == "COMPLETED"
+    assert len(published) == 1

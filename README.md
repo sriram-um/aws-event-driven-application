@@ -24,7 +24,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 5 | CI/CD | GitHub Actions (OIDC) | ✅ Done |
 | 6 | Asynchronous API | API Gateway → SQS | ✅ Done |
 | 7 | Dead-letter queues | SQS | ✅ Done |
-| 8 | Idempotency | Lambda, DynamoDB conditional writes | ⬜ |
+| 8 | Idempotency | Lambda, DynamoDB conditional writes | ✅ Done |
 | 9 | Disaster recovery | EventBridge Global Endpoints | ⬜ |
 | 10 | Cost estimate | AWS Pricing Calculator | ⬜ |
 
@@ -102,6 +102,26 @@ short notification (built by an EventBridge **input transformer**) to the SNS to
 queue subscribed with raw message delivery stands in for real subscribers (email, SMS,
 webhooks, other services) so delivery can be checked from the CLI.
 
+**Idempotency (exercise 8):** the client-generated `orderId` is the idempotency key, and the
+order header doubles as the idempotency record. CreateOrder processes a message like this:
+
+```
+claim: TransactWriteItems(header IN_PROGRESS + payloadHash + claimedBy=<messageId> + lock 30 s,
+                          all lines)  IF attribute_not_exists(orderId)
+ ├─ won ──────────────────────────────► PutEvents(OrderCreated) ─► header COMPLETED (+ eventId)
+ └─ lost (orderId exists) ─► read header (consistent)
+      ├─ different payloadHash (other items / other customer) ─► ORDER_ID_CONFLICT, drop, no change
+      ├─ COMPLETED ─────────────────────► return the stored result, no side effects
+      └─ IN_PROGRESS
+           ├─ claimed by this message, or lock expired ─► take over (conditional) ─► publish ─► COMPLETED
+           └─ live claim of another message ───────────► drop (that message finishes, or its retry does)
+```
+
+A publish failure now **fails the record**: SQS retries it after the visibility timeout, the
+retry finds its own unfinished claim and resumes — the event is published exactly when the order
+exists, closing the dual-write gap of exercise 1. FulfilOrder uses the same claim → publish →
+complete pattern on its Fulfilments item, so a duplicated `OrderCreated` is fulfilled once.
+
 **Failure handling (exercise 7):**
 
 ```
@@ -157,7 +177,7 @@ the rejected order (duplicate `itemId`) and a duplicate `orderId` CreateOrder sk
 
 | Item | `orderId` (PK) | `sk` (SK) | Attributes |
 |---|---|---|---|
-| Header | UUID v4 (client-generated since exercise 6) | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED` / `REJECTED`), `total` (N), `itemCount`, `acceptedAt` (API request time), `createdAt` (saved by CreateOrder), `reason` (only when `REJECTED`) |
+| Header | UUID v4 (client-generated since exercise 6) | `ORDER` | `customerId` (Cognito `sub`), `status` (`CREATED` / `REJECTED`), `total` (N), `itemCount`, `acceptedAt` (API request time), `createdAt` (saved by CreateOrder), `reason` (only when `REJECTED`); idempotency (exercise 8): `payloadHash` (SHA-256 of customer + sorted, normalised items), `processingState` (`IN_PROGRESS` → `COMPLETED`), `claimedBy` + `lockExpiresAt` (only while in progress), `eventId`, `completedAt` |
 | Line | same | `ITEM#<itemId>` | `itemId`, `productName`, `quantity` (N), `unitPrice` (N) |
 
 ### Event: `OrderCreated`
@@ -212,6 +232,7 @@ order with items and prices:
 | `customerId`, `itemCount`, `total` | Copied from the event (`total` kept as a string) |
 | `orderCreatedAt`, `fulfilledAt` | ISO-8601 UTC — the difference is the end-to-end async latency |
 | `sourceEventId` | EventBridge event id that produced the fulfilment (traceability) |
+| `processingState`, `claimedBy`, `lockExpiresAt` | Idempotency claim (exercise 8): `IN_PROGRESS` until `OrderFulfilled` is published, then `COMPLETED` |
 
 A `Query` on `orderId` returns the whole order. The header item gives later exercises one place
 for order-level state (status, idempotency/processing state) without changing the table schema.
@@ -227,6 +248,7 @@ scripts/measure_fulfilment.py Sends N orders and breaks down the async fulfilmen
 scripts/check_notifications.py Sends N orders and reads the SNS notifications from the test queue
 scripts/check_dashboard.py    Checks every dashboard metric has data; renders widgets to docs/images/
 scripts/dlq_demo.py           DLQ demos: poison messages, and a consumer outage + redrive
+scripts/idempotency_test.py   Duplicate/concurrent/conflicting requests and a publish failure, counted end to end
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
@@ -346,6 +368,27 @@ one per account, so the template references its ARN instead of creating it.
   a crash between the DynamoDB write and `PutEvents` loses the event. Exercise 8 revisits it;
   the alternatives are DynamoDB Streams → EventBridge Pipes (transactional outbox) or retrying
   from a processing state on the order header.
+- **Hand-written idempotency on the order header (not a separate table)** — the exercise asks to
+  "store the order and its processing state"; keeping both in one item means the claim, the
+  order and its lines are written in **one transaction**, so there is never an order without a
+  claim or a claim without an order. The [Powertools Idempotency utility](https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/)
+  implements the same idea (conditional put of an `INPROGRESS` record, payload validation hash,
+  expiry) as a decorator with its own table — less code, but a second write outside the order
+  transaction and a separate table to provision.
+- **`payloadHash` covers the customer and the normalised items** — a retry with items in another
+  order or `4` vs `4.00` is the *same* request; other items, or another customer re-using the id,
+  is a **conflict** and never overwrites the order (the 202 is already sent, so the conflict is
+  logged as `ORDER_ID_CONFLICT`; GET by the other customer stays 404).
+- **Lock 30 s: longer than the function timeout (10 s), shorter than the visibility timeout
+  (60 s)** — a running attempt never loses its claim, and the message's own retry always finds
+  it expired; `claimedBy = messageId` additionally lets a message resume its own claim.
+- **Duplicates while in progress are dropped, not retried** — the owning message either finishes
+  or fails and is retried by SQS itself, so a duplicate has nothing left to do (no extra receives,
+  no DLQ noise).
+- **Publish failures now fail the record** (they were only logged in exercises 1–7) — safe now
+  because the retry resumes instead of creating a duplicate. At-least-once remains: a crash
+  *after* `PutEvents` but *before* `COMPLETED` re-publishes on retry, which the idempotent
+  FulfilOrder absorbs.
 - **Async API = API Gateway → SQS direct integration, no Lambda in the request path** — the
   client gets 202 as soon as the order is durably queued; CreateOrder can be slow, throttled,
   cold or briefly broken without affecting the API (messages wait in the queue for up to 4 days).
@@ -653,3 +696,37 @@ throttled; real orders through the API; concurrency restored in a `finally` bloc
   `list-targets-by-rule`) but wasn't exercised — making a target fail means breaking its
   permissions on the live stack.
 - Cost: 3 standard alarms ≈ $0.30/month; DLQs and the alerts topic cost nothing while empty.
+
+### Exercise 8 — idempotency (measured 2026-10-18, us-east-1)
+
+`scripts/idempotency_test.py` against the deployed stack — for each scenario it counts, for the
+`orderId`, the order items in DynamoDB, the events in `/aws/events/<stack>`, the fulfilments and
+the Lambda log messages:
+
+| Scenario | Order items | `OrderCreated` | Fulfilments / `OrderFulfilled` | CreateOrder / FulfilOrder log |
+|---|---|---|---|---|
+| Same `PUT` 10× in parallel through the API (10 × 202) | 2 (header + 1 line) | **1** | 1 / 1 | 1 created, 8 "duplicate: returning the stored result", 1 "in progress elsewhere: dropping" |
+| 10 identical messages sent straight to the intake queue in one batch | 2 | **1** | 1 / 1 | 1 created, 5 stored result, 4 dropped while in progress (true concurrency across invocations) |
+| Same id with different items, then by another customer | 2 (original kept) | **1** | 1 / 1 | 1 created, 2 `ORDER_ID_CONFLICT` |
+| Stored `OrderCreated` re-sent 3× to the fulfilment queue | 2 | 1 | 1 / **1** | FulfilOrder: 1 fulfilled, 3 "duplicate OrderCreated: already fulfilled" |
+| **Publish gap**: `PutEvents` broken during processing, then restored | 2 | **1** | 1 / 1 | 1 "processing failed" (order saved, `IN_PROGRESS`), 1 "resuming unfinished order" on the SQS retry, 1 created — **completed 65 s after the PUT** (one 60 s visibility timeout) |
+
+- **The dual-write gap is closed in the real cloud**: the first attempt saved the order but
+  couldn't publish; the record failed, the header stayed `IN_PROGRESS`, and the retry published
+  the event and completed — no lost `OrderCreated`, no duplicate order. (A first run of this test
+  restored the function too late — a bug in the test, which waited for a log line that didn't
+  carry the `orderId` — so attempts 1 *and* 2 failed and attempt 3 resumed: the order survived
+  two failed publishes, one attempt before the DLQ.)
+- **Cost of idempotency**: warm CreateOrder 44–72 ms (transaction + `PutEvents` + the completing
+  `UpdateItem`) vs 36–44 ms for transaction + `PutEvents` in exercise 1; end to end
+  accepted → order saved is unchanged (median 123 ms vs 128 ms in exercise 6), accepted →
+  fulfilled median 257 ms.
+- **Bugs the unit tests caught before deploying:** (1) the DynamoDB *resource's* client
+  (`table.meta.client`) serializes plain Python values itself, so `TypeSerializer` output was
+  serialized twice (`Type mismatch … expected: S actual: M`); (2) a resumed fulfilment is read
+  back from DynamoDB with `Decimal` numbers, which `json.dumps` can't encode — every resume would
+  have failed and ended in the DLQ.
+- The 202 can't report a duplicate or a conflict — the API answers before CreateOrder runs.
+  A duplicate's "existing result" is what `GET /orders/{orderId}` returns (same as the first
+  request's); a conflict is visible in the logs (`ORDER_ID_CONFLICT`). A synchronous check would
+  need a Lambda or a conditional write in the API path, giving back part of exercise 6's latency.

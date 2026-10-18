@@ -83,6 +83,11 @@ Resources:
         # authorised per contained PutItem)
         - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
+        # Exercise 8: consistent read of the idempotency record after a lost conditional write
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt OrdersTable.Arn
         # Exercise 1: events:PutEvents on the orders bus only
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref OrdersEventBus
@@ -546,6 +551,11 @@ Resources:
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref FulfilmentsTable
+        # Exercise 8: consistent read of the idempotency record after a lost conditional write
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt FulfilmentsTable.Arn
         - EventBridgePutEventsPolicy:
             EventBusName: !Ref OrdersEventBus
       Events:

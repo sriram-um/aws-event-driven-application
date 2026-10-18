@@ -6,6 +6,7 @@ from pathlib import Path
 
 import boto3
 import pytest
+from aws_lambda_powertools.utilities.batch.exceptions import BatchProcessingError
 from moto import mock_aws
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "create_order"
@@ -146,15 +147,6 @@ def test_invalid_order_is_stored_as_rejected_not_retried(app, published, body, r
     assert published == []
 
 
-def test_duplicate_order_id_is_skipped_without_second_event(app, published):
-    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
-    resp = app.lambda_handler(_sqs_event(_record({"items": [ITEMS["items"][0]]}, i=1)), CTX)
-
-    assert resp == {"batchItemFailures": []}
-    assert len(published) == 1
-    assert str(_rows()[(ORDER_ID, "ORDER")]["total"]) == "25.0"  # first order kept
-
-
 def test_missing_message_attribute_fails_only_that_record(app):
     other = "11111111-2222-4333-8444-555555555555"
     resp = app.lambda_handler(_sqs_event(
@@ -166,17 +158,117 @@ def test_missing_message_attribute_fails_only_that_record(app):
     assert (other, "ORDER") in _rows()
 
 
-@pytest.mark.parametrize("failure", [
-    {"FailedEntryCount": 1, "Entries": [{"ErrorCode": "InternalFailure", "ErrorMessage": "boom"}]},
-    RuntimeError("network"),
-])
-def test_publish_failure_keeps_order_and_does_not_retry(app, monkeypatch, failure):
-    def failing_put_events(**kwargs):
-        if isinstance(failure, Exception):
-            raise failure
-        return failure
+def _header():
+    return _rows()[(ORDER_ID, "ORDER")]
 
-    monkeypatch.setattr(app.events, "put_events", failing_put_events)
+
+def _set_header(**attrs):
+    """Puts the header into a given state (e.g. an unfinished claim from an earlier attempt)."""
+    expr = ", ".join(f"#{k} = :{k}" for k in attrs)
+    boto3.resource("dynamodb").Table(TABLE).update_item(
+        Key={"orderId": ORDER_ID, "sk": "ORDER"}, UpdateExpression=f"SET {expr}",
+        ExpressionAttributeNames={f"#{k}": k for k in attrs},
+        ExpressionAttributeValues={f":{k}": v for k, v in attrs.items()})
+
+
+def _fail_publish(monkeypatch, app):
+    monkeypatch.setattr(app.events, "put_events", lambda **kw: {
+        "FailedEntryCount": 1, "Entries": [{"ErrorCode": "InternalFailure", "ErrorMessage": "boom"}]})
+
+
+# --- Exercise 8: idempotency -----------------------------------------------------------------
+
+def test_completed_order_records_idempotency_state(app, published):
+    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+
+    header = _header()
+    assert header["processingState"] == "COMPLETED"
+    assert len(header["payloadHash"]) == 64
+    assert header["eventId"]
+    assert "claimedBy" not in header and "lockExpiresAt" not in header
+
+
+def test_duplicate_returns_stored_result_without_side_effects(app, published):
+    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+    first = _header()
+    # Same request again (client retry / SQS redelivery), items in a different order and
+    # prices formatted differently - still the same order
+    retry = {"items": [{**ITEMS["items"][1], "unitPrice": 4.00}, ITEMS["items"][0]]}
+    resp = app.lambda_handler(_sqs_event(_record(retry, i=1)), CTX)
+
+    assert resp == {"batchItemFailures": []}
+    assert len(published) == 1                      # no second OrderCreated
+    assert _header() == first                       # nothing rewritten
+    assert app.record_handler(app.SQSRecord(_record(retry, i=2))) == app._result(first)
+
+
+@pytest.mark.parametrize("change", [
+    {"body": {"items": [ITEMS["items"][0]]}},                     # different items
+    {"customer_id": "someone-else"},                               # another customer, same id
+])
+def test_same_order_id_different_request_is_a_conflict(app, published, change):
+    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+    first = _header()
+    resp = app.lambda_handler(_sqs_event(_record(change.get("body", ITEMS), i=1,
+                                                 customer_id=change.get("customer_id", "user-123"))), CTX)
+
+    assert resp == {"batchItemFailures": []}        # permanent: consumed, not retried
+    assert _header() == first
+    assert len(published) == 1
+
+
+def test_publish_failure_fails_record_and_retry_resumes(app, monkeypatch, published):
+    recorder = app.events.put_events  # the published fixture
+    _fail_publish(monkeypatch, app)
+    # The dual-write gap is closed: the record fails instead of silently losing the event
+    # (a batch whose only record fails raises, so the whole invocation is retried)...
+    with pytest.raises(BatchProcessingError):
+        app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+    assert _header()["processingState"] == "IN_PROGRESS"
+    assert len(_rows()) == 3                         # order + lines saved once
+
+    # ...and SQS's retry of the same message resumes it
+    monkeypatch.setattr(app.events, "put_events", recorder)
     resp = app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
     assert resp == {"batchItemFailures": []}
-    assert (ORDER_ID, "ORDER") in _rows()
+    assert _header()["processingState"] == "COMPLETED"
+    assert len(published) == 1
+    assert len(_rows()) == 3
+
+
+def test_concurrent_copy_with_live_claim_is_dropped(app, published):
+    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+    # Another message is processing this order right now (fresh lock)
+    _set_header(processingState="IN_PROGRESS", claimedBy="msg-other", lockExpiresAt=int(app.time.time()) + 30)
+    resp = app.lambda_handler(_sqs_event(_record(ITEMS, i=1)), CTX)
+
+    assert resp == {"batchItemFailures": []}
+    assert len(published) == 1                       # only the original publish
+    assert _header()["claimedBy"] == "msg-other"     # claim untouched
+
+
+def test_expired_claim_of_another_message_is_taken_over(app, published):
+    app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+    # An earlier attempt by another message crashed after saving the order
+    _set_header(processingState="IN_PROGRESS", claimedBy="msg-crashed", lockExpiresAt=int(app.time.time()) - 1)
+    resp = app.lambda_handler(_sqs_event(_record(ITEMS, i=1)), CTX)
+
+    assert resp == {"batchItemFailures": []}
+    assert _header()["processingState"] == "COMPLETED"
+    assert len(published) == 2                       # the event the crashed attempt never sent
+
+
+def test_order_saved_before_exercise_8_counts_as_completed(app, published):
+    boto3.resource("dynamodb").Table(TABLE).put_item(Item={
+        "orderId": ORDER_ID, "sk": "ORDER", "customerId": "user-123", "status": "CREATED"})
+    resp = app.lambda_handler(_sqs_event(_record(ITEMS)), CTX)
+
+    assert resp == {"batchItemFailures": []}
+    assert published == []                           # no payloadHash -> treated as a conflict, never reprocessed
+
+
+def test_payload_hash_ignores_item_order_and_number_format(app):
+    a = app._parse_items(ITEMS)
+    b = app._parse_items({"items": [{**ITEMS["items"][1], "unitPrice": "4.000"}, ITEMS["items"][0]]})
+    assert app._payload_hash("u", a) == app._payload_hash("u", b)
+    assert app._payload_hash("u", a) != app._payload_hash("v", a)
