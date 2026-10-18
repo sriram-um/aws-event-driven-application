@@ -30,12 +30,15 @@ Parameters:
       Exercise 9 - EventBridge global endpoint id (output EndpointId of the
       <stack>-global-endpoint stack). Empty = Lambdas publish to the regional bus.
     Default: ''
-  PrimaryUserPoolKeyArn:
+  EnableUserPoolReplica:
     Type: String
     Description: >
-      Exercise 9 - secondary stack only: output UserPoolKeyArn of the primary stack (the
-      multi-Region KMS key this stack replicates for the Cognito user pool replica)
-    Default: not-used-in-the-primary-region
+      Exercise 9 - primary stack only: create the Cognito user pool replica in the secondary
+      region. Cognito requires the pool's KMS key to have a replica there first
+      (infra/user-pool-key-replica.yaml), so a first-time build deploys with 'false', creates the
+      key replica, then deploys again with 'true' (scripts/rebuild.sh).
+    AllowedValues: ['true', 'false']
+    Default: 'true'
   PrimaryUserPoolId:
     Type: String
     Description: >
@@ -49,7 +52,9 @@ Parameters:
 
 Conditions:
   IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
-  IsSecondaryRegion: !Not [!Condition IsPrimaryRegion]
+  CreateUserPoolReplica: !And
+    - !Condition IsPrimaryRegion
+    - !Equals [!Ref EnableUserPoolReplica, 'true']
 
 Globals:
   Function:
@@ -1120,7 +1125,8 @@ Resources:
   # ---------------------------------------------------------------------------
   # Exercise 9: Cognito multi-Region replication (one user directory, shared pool id and
   # `sub` in both regions). Prerequisite: a multi-Region customer managed key on the pool,
-  # available in both regions - the primary key here, its replica in the secondary stack.
+  # available in both regions - the primary key here, its replica in its own small stack in the
+  # secondary region (infra/user-pool-key-replica.yaml), which must exist before the replica.
   # ---------------------------------------------------------------------------
   UserPoolKey:
     Type: AWS::KMS::Key
@@ -1129,65 +1135,6 @@ Resources:
       Description: Orders user pool encryption at rest (multi-Region, required for Cognito MRR)
       MultiRegion: true
       EnableKeyRotation: true
-      PendingWindowInDays: 7
-      KeyPolicy:
-        Version: '2012-10-17'
-        Statement:
-          # Scoped to this account's user pools (a Ref to the pool would be circular: the pool
-          # references this key). ViaService covers both regions so the replica key can share it.
-          - Sid: CognitoServiceAccess
-            Effect: Allow
-            Principal:
-              Service:
-                - cognito-idp.amazonaws.com
-                - identitystore.amazonaws.com
-            Action:
-              - kms:Encrypt
-              - kms:Decrypt
-              - kms:ReEncrypt*
-              - kms:GenerateDataKeyWithoutPlaintext
-              - kms:DescribeKey
-            Resource: '*'
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref AWS::AccountId
-              ArnLike:
-                aws:SourceArn: !Sub 'arn:aws:cognito-idp:*:${AWS::AccountId}:userpool/*'
-          - Sid: AccessThroughCognito
-            Effect: Allow
-            Principal:
-              AWS: '*'
-            Action:
-              - kms:Encrypt
-              - kms:Decrypt
-              - kms:ReEncrypt*
-              - kms:GenerateDataKeyWithoutPlaintext
-              - kms:DescribeKey
-            Resource: '*'
-            Condition:
-              StringEquals:
-                kms:CallerAccount: !Ref AWS::AccountId
-                kms:ViaService:
-                  - !Sub 'cognito-idp.${PrimaryRegion}.amazonaws.com'
-                  - !Sub 'cognito-idp.${SecondaryRegion}.amazonaws.com'
-          - Sid: AccountAdministration
-            Effect: Allow
-            Principal:
-              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
-            Action: 'kms:*'
-            Resource: '*'
-      Tags:
-        - Key: project
-          Value: event-driven-orders
-
-  # Replica of the primary region's multi-Region key - same key material, so the Cognito
-  # replica in this region can decrypt the replicated user directory
-  UserPoolKeyReplica:
-    Type: AWS::KMS::ReplicaKey
-    Condition: IsSecondaryRegion
-    Properties:
-      Description: Replica of the orders user pool multi-Region key (Cognito MRR)
-      PrimaryKeyArn: !Ref PrimaryUserPoolKeyArn
       PendingWindowInDays: 7
       KeyPolicy:
         Version: '2012-10-17'
@@ -1279,7 +1226,7 @@ Resources:
   # resource has no status property). Users can only be created in the primary.
   UserPoolReplica:
     Type: AWS::Cognito::UserPoolReplica
-    Condition: IsPrimaryRegion
+    Condition: CreateUserPoolReplica
     Properties:
       UserPoolId: !Ref UserPool
       RegionName: !Ref SecondaryRegion
@@ -1324,7 +1271,7 @@ Outputs:
     Value: !If [IsPrimaryRegion, !Ref UserPoolClient, !Ref PrimaryUserPoolClientId]
   UserPoolKeyArn:
     Condition: IsPrimaryRegion
-    Description: Multi-Region KMS key of the user pool (the secondary stack replicates it)
+    Description: Multi-Region KMS key of the user pool (replicated by infra/user-pool-key-replica.yaml)
     Value: !GetAtt UserPoolKey.Arn
   EventBusName:
     Description: EventBridge bus receiving order events

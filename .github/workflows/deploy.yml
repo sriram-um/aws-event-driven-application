@@ -107,7 +107,7 @@ jobs:
       - name: Look up the primary stack's outputs the secondary depends on
         if: env.DEPLOYED == 'true'
         run: |
-          for key in UserPoolKeyArn UserPoolId UserPoolClientId; do
+          for key in UserPoolId UserPoolClientId; do
             echo "PRIMARY_$key=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue" --output text)" >> "$GITHUB_ENV"
           done
 
@@ -119,7 +119,6 @@ jobs:
           --no-fail-on-empty-changeset
           --role-arn ${{ secrets.AWS_CFN_EXECUTION_ROLE_ARN }}
           --parameter-overrides AppVersion=${{ github.sha }} GlobalEndpointId=${{ env.ENDPOINT_ID }}
-          PrimaryUserPoolKeyArn=${{ env.PRIMARY_UserPoolKeyArn }}
           PrimaryUserPoolId=${{ env.PRIMARY_UserPoolId }}
           PrimaryUserPoolClientId=${{ env.PRIMARY_UserPoolClientId }}
 

@@ -445,7 +445,8 @@ SAM="$SAM" bash scripts/rebuild.sh          # ~25-30 min - recreates everything 
 2. the Cognito replica (switched to `INACTIVE` first — only inactive replicas can be deleted);
 3. the us-west-2 stack (it only references the replicas; its KMS replica key is scheduled for
    deletion);
-4. the us-east-1 stack (global tables + replicas, user pool, KMS key — 7-day deletion window).
+4. the us-east-1 stack (global tables + replicas, user pool, KMS key — 7-day deletion window);
+5. the KMS key replica stack in us-west-2 (`infra/user-pool-key-replica.yaml`).
 
 It deliberately **keeps** the CI bootstrap stack (IAM roles cost nothing, and the GitHub secrets
 stay valid for a rebuild) and the shared SAM artifact buckets. While the stacks don't exist, pushes
@@ -456,7 +457,9 @@ the two repository secrets.
 
 **`scripts/rebuild.sh`** recreates the deployment from the templates, reading every changing id
 (KMS key, user pool and app client, global endpoint) from stack outputs — nothing is hard-coded:
-primary stack → activate the Cognito replica → secondary stack → global endpoint stack → both app
+primary stack with `EnableUserPoolReplica=false` → KMS key replica stack in us-west-2 (Cognito
+won't create a user pool replica until the key has a replica in that region) → primary again with
+the user pool replica, then activate it → secondary stack → global endpoint stack → both app
 stacks again with the endpoint id → test users (created in the primary, replicated) and the local
 credential files `~/.orders-event-driven-test-user*.env` → smoke tests in both regions. After that,
 CI deploys on every push again. Order data starts empty; `scripts/dr_test.py normal` places test
@@ -920,3 +923,25 @@ tables, visible in both regions within seconds.
   two `OrderCreated` events — each region's conditional write succeeds locally before global-table
   replication. Client retries normally go to the same region; closing this gap fully would need
   DynamoDB multi-Region strong consistency (three regions or a witness).
+
+### Teardown and rebuild, proven end to end (2026-10-18)
+
+| Run | Result | Duration |
+|---|---|---|
+| `teardown.sh` | All stacks and tables gone in both regions; KMS keys `PendingDeletion` / `PendingReplicaDeletion` | 13 min |
+| `rebuild.sh`, attempt 1 | **Failed** at step 1: `User pool's customer-managed KMS key does not have a replica for the requested region` | 4 min |
+| `rebuild.sh`, attempt 2 (fixed order) | Everything recreated with new ids (pool `us-east-1_m0UHpEhVR`, endpoint `267pg6fmuo.veo`); smoke tests 401/401 in both regions; `dr_test.py normal`: created in either region, fulfilled once in us-east-1, readable via both APIs, notifications 4 / 0 | 24 min (the Cognito replica alone ~14 min) |
+| `teardown.sh` again | Deployment removed — nothing left running | ~15 min |
+
+- **The incremental build had hidden an ordering dependency.** During exercise 9 the KMS key
+  replica already existed when the Cognito replica was added; from scratch, the primary stack tried
+  to create the user pool replica before the key had a replica in us-west-2. Fix: the key replica
+  moved into its own stack, and `EnableUserPoolReplica` lets the first primary deploy skip the
+  user pool replica. Only a real rebuild could find this.
+- **The failed create rolled back to `ROLLBACK_FAILED`:** DynamoDB refused to delete the brand-new
+  global tables' replicas (`Replica cannot be deleted because it has acted as a source region for
+  new replica(s) … in the last 24 hours`). A plain `delete-stack` afterwards removed the whole
+  tables without problems — the 24-hour rule applies to removing a *replica*, not the table.
+- **Cost of the proof:** a few cents — every resource is billed per request or prorated per hour,
+  and nothing stays running afterwards. The KMS keys created on each build are deleted after the
+  7-day window.

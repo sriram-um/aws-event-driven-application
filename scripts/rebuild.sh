@@ -2,12 +2,13 @@
 # Rebuilds the whole multi-region deployment from scratch (after scripts/teardown.sh).
 # Every id that changes between deployments (KMS key, user pool, app client, global endpoint)
 # is read from stack outputs - nothing is hard-coded. Order matters:
-#   1. primary stack (us-east-1): global tables + replicas, user pool, its multi-Region KMS key,
-#      the user pool replica (created INACTIVE)
-#   2. activate the user pool replica
-#   3. secondary stack (us-west-2): replica KMS key, authorizer on the replica pool
-#   4. global endpoint stack (needs the bus in both regions)
-#   5. both app stacks again, now publishing through the endpoint
+#   1. primary stack (us-east-1): global tables + replicas, user pool, its multi-Region KMS key
+#      (user pool replica off: Cognito needs the key's replica in us-west-2 first)
+#   2. KMS key replica stack (us-west-2)
+#   3. primary stack again with the user pool replica, then activate it (created INACTIVE)
+#   4. secondary stack (us-west-2): authorizer on the replica pool
+#   5. global endpoint stack (needs the bus in both regions), then both app stacks again,
+#      now publishing through the endpoint
 #   6. test users (created in the primary, replicated) + local credential files
 #   7. smoke test both regions
 # Prerequisites: the CI bootstrap stack can stay deployed (IAM is free); Docker not needed.
@@ -36,30 +37,34 @@ PYTHON=$PYTHON bash scripts/build_crt_layer.sh
 "$SAM" validate --lint
 "$SAM" build
 
-step "1/7 primary stack ($PRIMARY) - no global endpoint yet (publishes to the regional bus)"
-"$SAM" deploy --no-fail-on-empty-changeset
+step "1/7 primary stack ($PRIMARY) - user pool replica off, no global endpoint yet"
+"$SAM" deploy --no-fail-on-empty-changeset --parameter-overrides EnableUserPoolReplica=false
 
 KEY_ARN=$(out $PRIMARY $STACK UserPoolKeyArn)
 POOL_ID=$(out $PRIMARY $STACK UserPoolId)
 CLIENT_ID=$(out $PRIMARY $STACK UserPoolClientId)
 echo "user pool $POOL_ID, client $CLIENT_ID, key $KEY_ARN"
 
-step "2/7 activate the user pool replica in $SECONDARY"
+step "2/7 KMS key replica in $SECONDARY (Cognito needs it before the user pool replica)"
+aws cloudformation deploy --region $SECONDARY --template-file infra/user-pool-key-replica.yaml \
+  --stack-name $STACK-user-pool-key-replica --parameter-overrides PrimaryKeyArn="$KEY_ARN" \
+  --tags project=event-driven-orders --no-fail-on-empty-changeset
+
+step "3/7 primary stack - create the user pool replica, then activate it"
+"$SAM" deploy --no-fail-on-empty-changeset --parameter-overrides EnableUserPoolReplica=true
 "$PYTHON" scripts/activate_user_pool_replica.py ACTIVE
 
-step "3/7 secondary stack ($SECONDARY)"
-SECONDARY_PARAMS="PrimaryUserPoolKeyArn=$KEY_ARN PrimaryUserPoolId=$POOL_ID PrimaryUserPoolClientId=$CLIENT_ID"
+step "4/7 secondary stack ($SECONDARY) - authorizer on the replica pool"
+SECONDARY_PARAMS="PrimaryUserPoolId=$POOL_ID PrimaryUserPoolClientId=$CLIENT_ID"
 "$SAM" deploy --config-env dr --no-fail-on-empty-changeset --parameter-overrides $SECONDARY_PARAMS
 
-step "4/7 global endpoint stack ($PRIMARY)"
+step "5/7 global endpoint stack ($PRIMARY), then both app stacks publish through it"
 aws cloudformation deploy --region $PRIMARY --template-file infra/global-endpoint.yaml \
   --stack-name $STACK-global-endpoint --capabilities CAPABILITY_NAMED_IAM \
   --tags project=event-driven-orders --no-fail-on-empty-changeset
 ENDPOINT_ID=$(out $PRIMARY $STACK-global-endpoint EndpointId)
 echo "global endpoint $ENDPOINT_ID"
-
-step "5/7 both app stacks publish through the endpoint"
-"$SAM" deploy --no-fail-on-empty-changeset --parameter-overrides GlobalEndpointId=$ENDPOINT_ID
+"$SAM" deploy --no-fail-on-empty-changeset --parameter-overrides GlobalEndpointId=$ENDPOINT_ID EnableUserPoolReplica=true
 "$SAM" deploy --config-env dr --no-fail-on-empty-changeset \
   --parameter-overrides GlobalEndpointId=$ENDPOINT_ID $SECONDARY_PARAMS
 

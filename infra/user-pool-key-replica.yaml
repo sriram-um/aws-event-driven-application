@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Exercise 9 - replica (in the secondary region) of the user pool's multi-Region KMS key.
+  Cognito multi-Region replication requires the key to be available in the replica's region
+  BEFORE the user pool replica is created, so this stack sits between the two deploys of the
+  primary app stack (scripts/rebuild.sh):
+    aws cloudformation deploy --region us-west-2 --template-file infra/user-pool-key-replica.yaml
+      --stack-name orders-event-driven-app-user-pool-key-replica
+      --parameter-overrides PrimaryKeyArn=<primary stack output UserPoolKeyArn>
+
+Parameters:
+  PrimaryKeyArn:
+    Type: String
+    Description: Output UserPoolKeyArn of the primary app stack
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+
+Resources:
+  UserPoolKeyReplica:
+    Type: AWS::KMS::ReplicaKey
+    Properties:
+      Description: Replica of the orders user pool multi-Region key (Cognito MRR)
+      PrimaryKeyArn: !Ref PrimaryKeyArn
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Scoped to this account's user pools (a Ref to the pool would be circular: the pool
+          # references this key). ViaService covers both regions so the replica key can share it.
+          - Sid: CognitoServiceAccess
+            Effect: Allow
+            Principal:
+              Service:
+                - cognito-idp.amazonaws.com
+                - identitystore.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cognito-idp:*:${AWS::AccountId}:userpool/*'
+          - Sid: AccessThroughCognito
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService:
+                  - !Sub 'cognito-idp.${PrimaryRegion}.amazonaws.com'
+                  - !Sub 'cognito-idp.${SecondaryRegion}.amazonaws.com'
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+Outputs:
+  ReplicaKeyArn:
+    Value: !GetAtt UserPoolKeyReplica.Arn
