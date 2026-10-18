@@ -19,7 +19,7 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
 | 0 | Baseline orders API | API Gateway, Lambda, DynamoDB, Cognito | ✅ Done |
 | 1 | Publish events | EventBridge | ✅ Done |
 | 2 | Process messages | SQS, Lambda, DynamoDB | ✅ Done |
-| 3 | Send notifications | SNS | ⬜ |
+| 3 | Send notifications | SNS | ✅ Done |
 | 4 | Monitoring | CloudWatch dashboard | ⬜ |
 | 5 | CI/CD | GitHub Actions (OIDC) | ⬜ |
 | 6 | Asynchronous API | API Gateway → SQS | ⬜ |
@@ -48,8 +48,15 @@ template and deployed as updates to one CloudFormation stack (`orders-event-driv
                                      ┌───────►│ orders-event-driven-app-bus│─────►│ /aws/events/<stack>       │
                                      │        │ source orders.service      │all   │ copy of every order event │
                                      │        │ OrderCreated/OrderFulfilled│events│ (14-day retention)        │
-                                     │        └─────────────┬──────────────┘      └───────────────────────────┘
-                                     │                      │ rule: detail-type = OrderCreated
+                                     │        └──────┬──────┬──────────────┘      └───────────────────────────┘
+                                     │               │      │ rule: detail-type = OrderCreated
+                                     │               │      │
+                                     │   rule: OrderCreated + OrderFulfilled, InputTransformer
+                                     │               │      │      ┌────────────────────────┐  raw   ┌─────────────────────┐
+                                     │               └──────┼─────►│ SNS: order-            │───────►│ SQS test subscriber │
+                                     │                      │      │ notifications          │delivery│ <stack>-            │
+                                     │                      │      │ policy: only the rule  │        │ notifications-test  │
+                                     │                      │      └────────────────────────┘        └─────────────────────┘
                                      │        ┌─────────────▼──────────────┐
                                      │        │ SQS: <stack>-fulfilment    │ SSE-SQS · visibility 60 s
                                      │        │ queue policy: only the rule│ (6× function timeout)
@@ -73,6 +80,11 @@ Logs for inspection.
 queue → FulfilOrder (event source mapping) records the fulfilment (simulated warehouse, chosen by
 a hash of `orderId`) in the Fulfilments table → publishes `OrderFulfilled` back to the bus.
 The API response doesn't wait for any of this.
+
+**Notification path:** a third rule matches `OrderCreated` and `OrderFulfilled` and publishes a
+short notification (built by an EventBridge **input transformer**) to the SNS topic. An SQS
+queue subscribed with raw message delivery stands in for real subscribers (email, SMS,
+webhooks, other services) so delivery can be checked from the CLI.
 
 **Observability:** X-Ray active tracing on the API stage and the Lambda; structured JSON logs
 (Powertools `Logger`, correlation id = API Gateway request id, `app_version` key).
@@ -109,6 +121,25 @@ Money values are strings so consumers never lose precision to floats.
  "orderCreatedAt": "2026-10-18T14:20:19.072+00:00", "fulfilledAt": "2026-10-18T14:20:20.419+00:00"}
 ```
 
+### Notification (SNS message)
+
+Built by the input transformer — subscribers get a small, stable message instead of the full
+order with items and prices:
+
+```json
+{
+  "type": "OrderFulfilled",
+  "orderId": "e910267c-7708-4ce0-b3f9-5ea341d559b8",
+  "customerId": "843874a8-4081-70c7-f151-d3c8ab4c97c2",
+  "total": "1",
+  "warehouse": "CMH-1",
+  "time": "2026-10-18T14:30:57Z",
+  "message": "OrderFulfilled: order e910267c-7708-4ce0-b3f9-5ea341d559b8 (total 1)"
+}
+```
+
+`warehouse` is `""` for `OrderCreated` (the path doesn't exist in that event).
+
 ### Table: `orders-event-driven-app-Fulfilments`
 
 | Attribute | Notes |
@@ -131,6 +162,7 @@ samconfig.toml                Deploy config: "default" env (local, pinned profil
 src/create_order/app.py       CreateOrder Lambda handler (API → DynamoDB → EventBridge)
 src/fulfil_order/app.py       FulfilOrder Lambda handler (SQS → DynamoDB → EventBridge)
 scripts/measure_fulfilment.py Sends N orders and breaks down the async fulfilment latency
+scripts/check_notifications.py Sends N orders and reads the SNS notifications from the test queue
 events/create_order.json      Sample API Gateway-style event
 tests/unit/                   pytest + moto unit tests
 requirements-dev.txt          Test dependencies
@@ -213,6 +245,16 @@ curl -X POST "$API_URL/orders" -H "Authorization: $TOKEN" -H 'Content-Type: appl
   queue (confused-deputy protection). Queue encrypted with SSE-SQS (no KMS key cost).
 - **`MaximumBatchingWindowInSeconds: 0`** — measured: a 1 s window delayed fulfilment by up to
   20 s at low traffic (see below).
+- **EventBridge rule → SNS (no Lambda)** — EventBridge routes and reshapes the event itself
+  with an input transformer, so notifications need no code, and SNS fans out to any number of
+  subscribers.
+- **Input transformer instead of passing the whole event** — decouples subscribers from the
+  internal event schema and keeps item/price data out of notifications.
+- **Topic not encrypted** — SNS encrypted with the AWS-managed `aws/sns` key can't receive from
+  EventBridge (the managed key policy can't grant `events.amazonaws.com`); a customer-managed
+  KMS key would work for ~$1/month. Messages carry ids and totals only.
+- **SQS test subscriber with raw message delivery** — scriptable verification without an
+  inbox; raw delivery passes the notification JSON as-is instead of in an SNS envelope.
 - **Log-group rule as a debug/audit trail** — makes every event visible (and queryable with Logs
   Insights) before any consumer exists. Log targets must be under `/aws/events/` and need a
   CloudWatch Logs **resource policy** allowing `events.amazonaws.com`.
@@ -286,3 +328,23 @@ order header, SQS `SentTimestamp` / `ApproximateFirstReceiveTimestamp`, and `ful
   (harmless) but publish a second `OrderFulfilled`. Exercise 8 makes FulfilOrder idempotent.
 - A consumer failing *all* records makes Powertools raise (whole batch retried) — caught by a
   unit test that initially expected a partial-failure response.
+
+### Exercise 3 — SNS notifications (measured 2026-10-18, us-east-1)
+
+`scripts/check_notifications.py 5` (5 orders through the API):
+
+| Measurement | min / median / max |
+|---|---|
+| Order saved → `OrderCreated` notification in the subscriber queue | 103 / 128 / 378 ms |
+| Order saved → `OrderFulfilled` notification in the subscriber queue | 213 / 254 / 805 ms |
+
+- 10/10 notifications received (one `OrderCreated` + one `OrderFulfilled` per order).
+- Metrics agree end to end: rule `MatchedEvents` 10 = `Invocations` 10, no
+  `FailedInvocations`; SNS `NumberOfMessagesPublished` 10 = `NumberOfNotificationsDelivered` 10,
+  `NumberOfNotificationsFailed` 0.
+- **Input transformer: a path missing from the event becomes an empty string** inside a quoted
+  template placeholder (`"warehouse": ""` on `OrderCreated`) — no error, so check templates
+  against every event type the rule matches.
+- Notifications are not ordered: SNS (standard) and EventBridge give no ordering guarantee, so a
+  subscriber could see `OrderFulfilled` before `OrderCreated` under load — consumers should rely
+  on `type`/`time`, not arrival order. (A FIFO topic would only help for FIFO-capable targets.)

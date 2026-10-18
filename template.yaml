@@ -279,6 +279,112 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/${FulfilOrderFunction}'
       RetentionInDays: 14
 
+  # ---------------------------------------------------------------------------
+  # Exercise 3: SNS order notifications - OrderCreated / OrderFulfilled -> topic
+  # ---------------------------------------------------------------------------
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-order-notifications'
+      DisplayName: Order notifications
+      # Not encrypted on purpose: with the AWS-managed aws/sns key EventBridge can't publish
+      # (its key policy can't grant events.amazonaws.com kms:GenerateDataKey). A customer
+      # managed KMS key would work but costs ~$1/month; the messages carry no payment data.
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  OrderNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OrderNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Only the notifications rule may publish (confused-deputy protection)
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderNotificationsRule.Arn
+
+  OrderNotificationsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-order-notifications'
+      Description: Publishes a short notification to SNS for every order status change
+      EventBusName: !Ref OrdersEventBus
+      EventPattern:
+        source:
+          - orders.service
+        detail-type:
+          - OrderCreated
+          - OrderFulfilled
+      State: ENABLED
+      Targets:
+        - Id: order-notifications-topic
+          Arn: !Ref OrderNotificationsTopic
+          # Subscribers get a small, stable notification - not the full order (items, prices)
+          InputTransformer:
+            InputPathsMap:
+              eventType: $.detail-type
+              orderId: $.detail.orderId
+              customerId: $.detail.customerId
+              total: $.detail.total
+              warehouse: $.detail.warehouse
+              time: $.time
+            InputTemplate: |
+              {
+                "type": "<eventType>",
+                "orderId": "<orderId>",
+                "customerId": "<customerId>",
+                "total": "<total>",
+                "warehouse": "<warehouse>",
+                "time": "<time>",
+                "message": "<eventType>: order <orderId> (total <total>)"
+              }
+
+  # Test subscriber: lets the notifications be checked from the CLI (no email needed)
+  NotificationsTestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-notifications-test'
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 86400   # 1 day - test messages only
+      Tags:
+        - Key: project
+          Value: event-driven-orders
+
+  NotificationsTestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotificationsTestQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationsTestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderNotificationsTopic
+
+  NotificationsTestSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderNotificationsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationsTestQueue.Arn
+      # Deliver the notification JSON as-is instead of wrapped in an SNS envelope
+      RawMessageDelivery: true
+
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -357,6 +463,12 @@ Outputs:
   FulfilOrderFunctionName:
     Description: Name of the FulfilOrder Lambda function
     Value: !Ref FulfilOrderFunction
+  OrderNotificationsTopicArn:
+    Description: SNS topic receiving order notifications
+    Value: !Ref OrderNotificationsTopic
+  NotificationsTestQueueUrl:
+    Description: SQS queue subscribed to the notifications topic (for testing)
+    Value: !Ref NotificationsTestQueue
   CreateOrderFunctionName:
     Description: Name of the CreateOrder Lambda function
     Value: !Ref CreateOrderFunction
