@@ -5,7 +5,9 @@ This script reads the dashboard back, expands CloudWatch's "." / "..." shorthand
 metric over the last N minutes. It also renders each metric widget with GetMetricWidgetImage
 into docs/images/ for the README.
 
-Usage: python scripts/check_dashboard.py [minutes] [--images]
+Usage: python scripts/check_dashboard.py [minutes] [--images] [--only=<title substring>]
+
+--only limits which widgets are re-rendered, so images other README sections describe are kept.
 """
 import json
 import re
@@ -40,7 +42,7 @@ def expand(metrics):
     return out
 
 
-def main(minutes=30, images=False):
+def main(minutes=30, images=False, only=None):
     cw = session.client("cloudwatch")
     body = json.loads(cw.get_dashboard(DashboardName=f"{STACK}-dashboard")["DashboardBody"])
     end = datetime.now(timezone.utc)
@@ -63,7 +65,7 @@ def main(minutes=30, images=False):
             value = points[0][stat] if points else None
             empty += value is None
             print(f"  {'NO DATA' if value is None else f'{value:>8.1f}'}  {stat:<8} {opts.get('label', metric)}")
-        if images:
+        if images and (only is None or only.lower() in props["title"].lower()):
             IMAGES.mkdir(parents=True, exist_ok=True)
             widget_def = {**props, "start": f"-PT{minutes}M", "width": 600, "height": 300}
             png = cw.get_metric_widget_image(MetricWidget=json.dumps(widget_def))["MetricWidgetImage"]
@@ -75,4 +77,5 @@ def main(minutes=30, images=False):
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")  # widget labels contain arrows (Windows console is cp1252)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    main(int(args[0]) if args else 30, "--images" in sys.argv)
+    only = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--only=")), None)
+    main(int(args[0]) if args else 30, "--images" in sys.argv, only)
